@@ -9,19 +9,24 @@ from telegram import Bot
 from datetime import datetime
 
 # ================== НАЛАШТУВАННЯ ==================
+# Все секреты берем из Variables/Secrets.
+# Если ты не хочешь переносить Tuya-данные в Variables — оставь их как строки ниже,
+# но это менее безопасно.
 
-TELEGRAM_TOKEN = "8548566635:AAHp5kldVqeVkfzm-V09diSgrNBVtkMQVKc"   # <-- СЮДА ВСТАВИШ TOKEN
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+if not TELEGRAM_TOKEN:
+    raise ValueError("❌ TELEGRAM_TOKEN не знайдено у Variables/Secrets")
 
-CHAT_ID = 287224456
+CHAT_ID = int(os.getenv("CHAT_ID", "287224456"))
 
-ACCESS_ID = "9gecmcdum9rj8q7uymgc"
-ACCESS_SECRET = "058a6a9bbe7d4beb800e65500822f413"
-DEVICE_ID = "bfa197db4a74f16983d2ru"
-REGION = "eu"
+ACCESS_ID = os.getenv("ACCESS_ID", "9gecmcdum9rj8q7uymgc").strip()
+ACCESS_SECRET = os.getenv("ACCESS_SECRET", "058a6a9bbe7d4beb800e65500822f413").strip()
+DEVICE_ID = os.getenv("DEVICE_ID", "bfa197db4a74f16983d2ru").strip()
+REGION = os.getenv("REGION", "eu").strip()
 
-CHECK_INTERVAL = 60        # секунд між перевірками
-DEBOUNCE_INTERVAL = 20     # секунд стабільності
-MAX_LOG_DAYS = 60          # зберігати лог 60 днів
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))        # секунд між перевірками
+DEBOUNCE_INTERVAL = int(os.getenv("DEBOUNCE_INTERVAL", "20"))  # секунд стабільності
+MAX_LOG_DAYS = int(os.getenv("MAX_LOG_DAYS", "60"))            # зберігати лог 60 днів
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BASE_DIR, "state.json")
@@ -45,6 +50,7 @@ def sha256_hex(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 def format_duration(seconds: int) -> str:
+    seconds = int(seconds)
     h = seconds // 3600
     m = (seconds % 3600) // 60
     s = seconds % 60
@@ -80,7 +86,7 @@ def load_state():
     if not os.path.exists(STATE_FILE):
         return
     try:
-        with open(STATE_FILE, "r") as f:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
             last_online_state = data.get("online")
             last_change_time = data.get("timestamp")
@@ -90,7 +96,7 @@ def load_state():
 
 def save_state():
     try:
-        with open(STATE_FILE, "w") as f:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(
                 {"online": last_online_state, "timestamp": last_change_time},
                 f
@@ -105,41 +111,44 @@ def save_log(state, duration):
     log = []
     if os.path.exists(LOG_FILE):
         try:
-            with open(LOG_FILE, "r") as f:
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
                 log = json.load(f)
-        except:
+        except Exception:
             log = []
 
     log.append({
         "timestamp": int(time.time()),
-        "state": state,
-        "duration": duration
+        "state": bool(state),
+        "duration": int(duration)
     })
 
     cutoff = int(time.time()) - MAX_LOG_DAYS * 24 * 3600
-    log = [x for x in log if x["timestamp"] >= cutoff]
+    log = [x for x in log if x.get("timestamp", 0) >= cutoff]
 
-    with open(LOG_FILE, "w") as f:
+    with open(LOG_FILE, "w", encoding="utf-8") as f:
         json.dump(log, f)
 
 def summarize(days):
     now = int(time.time())
-    start = now - days * 24 * 3600
+    start = now - int(days) * 24 * 3600
     online = 0
     offline = 0
 
     if not os.path.exists(LOG_FILE):
         return online, offline
 
-    with open(LOG_FILE, "r") as f:
-        log = json.load(f)
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            log = json.load(f)
+    except Exception:
+        return online, offline
 
     for entry in log:
-        if entry["timestamp"] >= start:
-            if entry["state"]:
-                online += entry["duration"]
+        if entry.get("timestamp", 0) >= start:
+            if entry.get("state"):
+                online += int(entry.get("duration", 0))
             else:
-                offline += entry["duration"]
+                offline += int(entry.get("duration", 0))
 
     return online, offline
 
@@ -161,7 +170,7 @@ async def get_access_token():
             raise RuntimeError(data)
         access_token = data["result"]["access_token"]
         token_expire_at = time.time() + data["result"]["expire_time"] - 60
-        print("✅ Access token отримано")
+        print("✅ Tuya access_token отримано")
 
 async def get_device_online_status() -> bool:
     global access_token
@@ -179,7 +188,7 @@ async def get_device_online_status() -> bool:
         data = r.json()
         if not data.get("success"):
             raise RuntimeError(data)
-        return data["result"]["online"]
+        return bool(data["result"]["online"])
 
 
 # ================== MONITOR ==================
@@ -206,14 +215,18 @@ async def monitor():
                     pending_time = now
                 elif now - pending_time >= DEBOUNCE_INTERVAL:
                     duration = int(now - last_change_time)
+
                     msg = (
                         f"💡 Світло зʼявилось\n🌑 Темрява: {format_duration(duration)}"
                         if pending_state
                         else
                         f"❌ Світло зникло\n⏱ Світло було: {format_duration(duration)}"
                     )
+
                     await bot.send_message(CHAT_ID, msg)
+
                     save_log(last_online_state, duration)
+
                     last_online_state = pending_state
                     last_change_time = now
                     pending_state = None
@@ -234,24 +247,31 @@ async def monitor():
 # ================== SUMMARY ==================
 
 async def summary_scheduler():
+    """
+    Каждый день в 00:01 — дневной отчёт.
+    Каждый понедельник в 00:01 — недельный отчёт.
+    """
     while True:
         try:
             now = datetime.now()
 
+            # 00:01 — отчёты
             if now.hour == 0 and now.minute == 1:
+                # Сначала недельный (если понедельник)
+                if now.weekday() == 0:
+                    online, offline = summarize(7)
+                    await bot.send_message(
+                        CHAT_ID,
+                        f"📊 Підсумки за тиждень:\nONLINE {format_duration(online)}, OFFLINE {format_duration(offline)}"
+                    )
+                    await asyncio.sleep(61)
+                    continue
+
+                # Иначе дневной
                 online, offline = summarize(1)
                 await bot.send_message(
                     CHAT_ID,
                     f"📊 Підсумки за день:\nONLINE {format_duration(online)}, OFFLINE {format_duration(offline)}"
-                )
-                await asyncio.sleep(61)
-                continue
-
-            if now.weekday() == 0 and now.hour == 0 and now.minute == 1:
-                online, offline = summarize(7)
-                await bot.send_message(
-                    CHAT_ID,
-                    f"📊 Підсумки за тиждень:\nONLINE {format_duration(online)}, OFFLINE {format_duration(offline)}"
                 )
                 await asyncio.sleep(61)
                 continue
@@ -271,16 +291,25 @@ async def telegram_commands():
             updates = await bot.get_updates(offset=offset, timeout=10)
             for u in updates:
                 offset = u.update_id + 1
-                if not u.message:
+                if not u.message or not u.message.text:
                     continue
                 if u.message.chat.id != CHAT_ID:
                     continue
 
-                if u.message.text == "/summary_day":
+                text = u.message.text.strip()
+
+                if text == "/summary_day":
                     o, f = summarize(1)
                     await bot.send_message(
                         CHAT_ID,
                         f"📊 За день:\nONLINE {format_duration(o)}, OFFLINE {format_duration(f)}"
+                    )
+
+                elif text == "/summary_week":
+                    o, f = summarize(7)
+                    await bot.send_message(
+                        CHAT_ID,
+                        f"📊 За тиждень:\nONLINE {format_duration(o)}, OFFLINE {format_duration(f)}"
                     )
 
         except Exception as e:
