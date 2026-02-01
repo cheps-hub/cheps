@@ -22,6 +22,7 @@ ACCESS_SECRET = os.getenv("ACCESS_SECRET", "").strip() or "058a6a9bbe7d4beb800e6
 DEVICE_ID = os.getenv("DEVICE_ID", "").strip() or "bfa197db4a74f16983d2ru"
 REGION = os.getenv("REGION", "eu").strip()
 
+# Webhook
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip()
 if not PUBLIC_URL:
     raise ValueError("❌ PUBLIC_URL не задан. Приклад: https://xxxxx.up.railway.app")
@@ -52,6 +53,8 @@ last_change_time = None
 pending_state = None
 pending_time = None
 
+START_TS = time.time()
+
 
 # ================== HELPERS ==================
 
@@ -64,6 +67,25 @@ def format_duration(seconds: int) -> str:
     m = (seconds % 3600) // 60
     s = seconds % 60
     return f"{h:02}:{m:02}:{s:02}"
+
+def ts_to_str(ts: float) -> str:
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "n/a"
+
+def normalize_cmd(text: str) -> str:
+    """
+    /cmd, /cmd@botname, /cmd extra -> "/cmd"
+    """
+    if not text:
+        return ""
+    t = text.strip()
+    if not t:
+        return ""
+    first = t.split()[0]
+    first = first.split("@")[0]
+    return first.lower()
 
 def sign_request(method: str, url: str, body: str = "", token: str = "") -> dict:
     t = str(int(time.time() * 1000))
@@ -229,13 +251,11 @@ async def monitor():
                         f"💡 Світло зʼявилось\n🌑 Темрява: {format_duration(duration)}"
                         if pending_state
                         else
-                        f"❌ Світло зникло\n⏱ Час світла: {format_duration(duration)}"
+                        f"❌ Світло зникло\n⏱ Світло було: {format_duration(duration)}"
                     )
 
                     try:
-                        print("➡️ sending light-change message...")
                         await bot.send_message(CHAT_ID, msg)
-                        print("✅ sent light-change message")
                     except Exception as e:
                         print("❌ send light-change error:", e)
 
@@ -269,12 +289,10 @@ async def summary_scheduler():
                 if now.weekday() == 0:
                     online, offline = summarize(7)
                     try:
-                        print("➡️ sending auto summary_week...")
                         await bot.send_message(
                             CHAT_ID,
                             f"📊 Підсумки за тиждень:\nONLINE {format_duration(online)}, OFFLINE {format_duration(offline)}"
                         )
-                        print("✅ sent auto summary_week")
                     except Exception as e:
                         print("❌ send auto summary_week error:", e)
 
@@ -283,12 +301,10 @@ async def summary_scheduler():
 
                 online, offline = summarize(1)
                 try:
-                    print("➡️ sending auto summary_day...")
                     await bot.send_message(
                         CHAT_ID,
                         f"📊 Підсумки за день:\nONLINE {format_duration(online)}, OFFLINE {format_duration(offline)}"
                     )
-                    print("✅ sent auto summary_day")
                 except Exception as e:
                     print("❌ send auto summary_day error:", e)
 
@@ -337,6 +353,18 @@ async def handle_update_safe(update: dict):
         print("ERROR handle_update:", e)
 
 
+def build_help_text() -> str:
+    return (
+        "🛠 Команди:\n"
+        "/status — поточний статус (ONLINE/OFFLINE + тривалість)\n"
+        "/uptime — скільки працює бот\n"
+        "/last_change — коли останній раз змінився стан\n"
+        "/summary_day — підсумок за 24 години\n"
+        "/summary_week — підсумок за 7 днів\n"
+        "/help — ця підказка"
+    )
+
+
 async def handle_update(update: dict):
     message = update.get("message") or update.get("edited_message")
     if not message:
@@ -344,42 +372,63 @@ async def handle_update(update: dict):
 
     chat_id = (message.get("chat") or {}).get("id")
     raw = (message.get("text") or "")
-    text = raw.strip()
+    cmd = normalize_cmd(raw)
 
-    if raw:
-        print(f"📩 incoming: chat_id={chat_id} expected={CHAT_ID} raw={raw!r}")
+    if cmd:
+        print(f"📩 cmd={cmd} chat_id={chat_id}")
 
-    cmd = ""
-    if text:
-        cmd = text.split()[0].split("@")[0].lower()
-
+    # Обробляємо тільки потрібний чат
     if chat_id != CHAT_ID:
-        print("⚠️ chat mismatch -> ignore")
         return
 
-    if cmd == "/summary_day":
-        o, f = summarize(1)
-        try:
-            print("➡️ sending summary_day...")
+    try:
+        if cmd == "/help":
+            await bot.send_message(CHAT_ID, build_help_text())
+
+        elif cmd == "/status":
+            now = time.time()
+            if last_online_state is None or last_change_time is None:
+                text = "ℹ️ Статус ще не визначено"
+            else:
+                state_text = "ONLINE ⚡" if last_online_state else "OFFLINE 🌑"
+                duration = format_duration(int(now - last_change_time))
+                text = (
+                    f"📡 Поточний статус:\n"
+                    f"{state_text}\n"
+                    f"⏱ У цьому стані: {duration}"
+                )
+            await bot.send_message(CHAT_ID, text)
+
+        elif cmd == "/uptime":
+            up = format_duration(int(time.time() - START_TS))
+            await bot.send_message(CHAT_ID, f"⏱ Uptime: {up}")
+
+        elif cmd == "/last_change":
+            if last_change_time is None or last_online_state is None:
+                await bot.send_message(CHAT_ID, "ℹ️ Ще немає даних про зміни стану")
+            else:
+                state_text = "ONLINE ⚡" if last_online_state else "OFFLINE 🌑"
+                await bot.send_message(
+                    CHAT_ID,
+                    f"🕒 Остання зміна:\n{state_text}\n{ts_to_str(last_change_time)}"
+                )
+
+        elif cmd == "/summary_day":
+            o, f = summarize(1)
             await bot.send_message(
                 CHAT_ID,
                 f"📊 За день:\nONLINE {format_duration(o)}, OFFLINE {format_duration(f)}"
             )
-            print("✅ sent summary_day")
-        except Exception as e:
-            print("❌ send summary_day error:", e)
 
-    elif cmd == "/summary_week":
-        o, f = summarize(7)
-        try:
-            print("➡️ sending summary_week...")
+        elif cmd == "/summary_week":
+            o, f = summarize(7)
             await bot.send_message(
                 CHAT_ID,
                 f"📊 За тиждень:\nONLINE {format_duration(o)}, OFFLINE {format_duration(f)}"
             )
-            print("✅ sent summary_week")
-        except Exception as e:
-            print("❌ send summary_week error:", e)
+
+    except Exception as e:
+        print("❌ command handler error:", e)
 
 
 async def webhook_handler(request: web.Request):
@@ -428,4 +477,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
