@@ -6,30 +6,32 @@ import json
 import os
 import httpx
 from telegram import Bot
-from datetime import datetime
+from datetime import datetime, timedelta
 from aiohttp import web
 
-# ================== НАЛАШТУВАННЯ ==================
+# ================== НАСТРОЙКИ (Variables) ==================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 if not TELEGRAM_TOKEN:
-    raise ValueError("❌ TELEGRAM_TOKEN не знайдено у Variables")
+    raise ValueError("TELEGRAM_TOKEN not set")
 
 CHAT_ID = int(os.getenv("CHAT_ID", "287224456"))
 
-ACCESS_ID = os.getenv("ACCESS_ID", "").strip() or "9gecmcdum9rj8q7uymgc"
-ACCESS_SECRET = os.getenv("ACCESS_SECRET", "").strip() or "058a6a9bbe7d4beb800e65500822f413"
-DEVICE_ID = os.getenv("DEVICE_ID", "").strip() or "bfa197db4a74f16983d2ru"
+ACCESS_ID = os.getenv("ACCESS_ID", "").strip()
+ACCESS_SECRET = os.getenv("ACCESS_SECRET", "").strip()
+DEVICE_ID = os.getenv("DEVICE_ID", "").strip()
 REGION = os.getenv("REGION", "eu").strip()
 
-# Webhook
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip()
 if not PUBLIC_URL:
-    raise ValueError("❌ PUBLIC_URL не задан. Приклад: https://xxxxx.up.railway.app")
+    raise ValueError("PUBLIC_URL not set (e.g. https://xxxxx.up.railway.app)")
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 if not WEBHOOK_SECRET:
-    raise ValueError("❌ WEBHOOK_SECRET не задан. Додай будь-який складний рядок у Variables")
+    raise ValueError("WEBHOOK_SECRET not set")
+
+# ru | uk | en
+LOCALE = os.getenv("LOCALE", "ru").strip().lower()
 
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -41,7 +43,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BASE_DIR, "state.json")
 LOG_FILE = os.path.join(BASE_DIR, "log.json")
 
-# ==================================================
+# ============================================================
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
@@ -55,24 +57,38 @@ pending_time = None
 
 START_TS = time.time()
 
+# ================== Форматы времени (без секунд) ==================
 
-# ================== HELPERS ==================
+def _day_suffix() -> str:
+    # просили именно: "дн" и "days"
+    return "days" if LOCALE == "en" else "дн"
 
-def sha256_hex(text: str) -> str:
-    return hashlib.sha256(text.encode()).hexdigest()
+def format_hhmm(seconds: int) -> str:
+    """Всегда HH:MM (без дней, без секунд)."""
+    minutes = int(seconds) // 60
+    h = minutes // 60
+    m = minutes % 60
+    return f"{h:02}:{m:02}"
 
-def format_duration(seconds: int) -> str:
-    seconds = int(seconds)
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    return f"{h:02}:{m:02}:{s:02}"
+def format_days_hhmm(seconds: int) -> str:
+    """
+    Для недели/месяца:
+    - если days == 0 -> HH:MM
+    - если days > 0  -> 'Xd <дн/days> HH:MM'
+    """
+    minutes = int(seconds) // 60
+    days = minutes // (24 * 60)
+    minutes_left = minutes % (24 * 60)
+    h = minutes_left // 60
+    m = minutes_left % 60
+
+    if days > 0:
+        return f"{days}{_day_suffix()} {h:02}:{m:02}"
+    return f"{h:02}:{m:02}"
 
 def ts_to_str(ts: float) -> str:
-    try:
-        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return "n/a"
+    """Дата-время без секунд."""
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
 
 def normalize_cmd(text: str) -> str:
     """
@@ -80,19 +96,22 @@ def normalize_cmd(text: str) -> str:
     """
     if not text:
         return ""
-    t = text.strip()
-    if not t:
-        return ""
-    first = t.split()[0]
-    first = first.split("@")[0]
-    return first.lower()
+    return text.strip().split()[0].split("@")[0].lower()
+
+# ================== TUYA ==================
+
+def sha256_hex(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
 
 def sign_request(method: str, url: str, body: str = "", token: str = "") -> dict:
+    # если Tuya ключи не заданы — лучше упасть сразу
+    if not ACCESS_ID or not ACCESS_SECRET:
+        raise ValueError("ACCESS_ID/ACCESS_SECRET not set")
+
     t = str(int(time.time() * 1000))
     body_hash = sha256_hex(body)
-    string_to_sign = (
-        ACCESS_ID + token + t + method + "\n" + body_hash + "\n\n" + url
-    )
+    string_to_sign = ACCESS_ID + token + t + method + "\n" + body_hash + "\n\n" + url
+
     sign = hmac.new(
         ACCESS_SECRET.encode(),
         string_to_sign.encode(),
@@ -109,83 +128,6 @@ def sign_request(method: str, url: str, body: str = "", token: str = "") -> dict
         headers["access_token"] = token
     return headers
 
-
-# ================== STATE ==================
-
-def load_state():
-    global last_online_state, last_change_time
-    if not os.path.exists(STATE_FILE):
-        return
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            last_online_state = data.get("online")
-            last_change_time = data.get("timestamp")
-            print(f"✅ Стан відновлено: online={last_online_state}")
-    except Exception as e:
-        print("ERROR load_state:", e)
-
-def save_state():
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(
-                {"online": last_online_state, "timestamp": last_change_time},
-                f
-            )
-    except Exception as e:
-        print("ERROR save_state:", e)
-
-
-# ================== LOG ==================
-
-def save_log(state, duration):
-    log = []
-    if os.path.exists(LOG_FILE):
-        try:
-            with open(LOG_FILE, "r", encoding="utf-8") as f:
-                log = json.load(f)
-        except Exception:
-            log = []
-
-    log.append({
-        "timestamp": int(time.time()),
-        "state": bool(state),
-        "duration": int(duration)
-    })
-
-    cutoff = int(time.time()) - MAX_LOG_DAYS * 24 * 3600
-    log = [x for x in log if x.get("timestamp", 0) >= cutoff]
-
-    with open(LOG_FILE, "w", encoding="utf-8") as f:
-        json.dump(log, f)
-
-def summarize(days):
-    now = int(time.time())
-    start = now - int(days) * 24 * 3600
-    online = 0
-    offline = 0
-
-    if not os.path.exists(LOG_FILE):
-        return online, offline
-
-    try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            log = json.load(f)
-    except Exception:
-        return online, offline
-
-    for entry in log:
-        if entry.get("timestamp", 0) >= start:
-            if entry.get("state"):
-                online += int(entry.get("duration", 0))
-            else:
-                offline += int(entry.get("duration", 0))
-
-    return online, offline
-
-
-# ================== TUYA ==================
-
 async def get_access_token():
     global access_token, token_expire_at
     url = "/v1.0/token?grant_type=1"
@@ -201,10 +143,12 @@ async def get_access_token():
             raise RuntimeError(data)
         access_token = data["result"]["access_token"]
         token_expire_at = time.time() + data["result"]["expire_time"] - 60
-        print("✅ Tuya access_token отримано")
 
 async def get_device_online_status() -> bool:
     global access_token
+    if not DEVICE_ID:
+        raise ValueError("DEVICE_ID not set")
+
     if not access_token or time.time() > token_expire_at:
         await get_access_token()
 
@@ -221,14 +165,90 @@ async def get_device_online_status() -> bool:
             raise RuntimeError(data)
         return bool(data["result"]["online"])
 
+# ================== STATE & LOG ==================
+
+def load_state():
+    global last_online_state, last_change_time
+    if not os.path.exists(STATE_FILE):
+        return
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        last_online_state = d.get("online")
+        last_change_time = d.get("timestamp")
+    except Exception as e:
+        print("ERROR load_state:", e)
+
+def save_state():
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"online": last_online_state, "timestamp": last_change_time}, f)
+    except Exception as e:
+        print("ERROR save_state:", e)
+
+def _read_log():
+    if not os.path.exists(LOG_FILE):
+        return []
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or []
+    except Exception:
+        return []
+
+def save_log(state: bool, duration: int):
+    log = _read_log()
+
+    log.append({
+        "timestamp": int(time.time()),
+        "state": bool(state),
+        "duration": int(duration)
+    })
+
+    cutoff = int(time.time()) - MAX_LOG_DAYS * 86400
+    log = [x for x in log if int(x.get("timestamp", 0)) >= cutoff]
+
+    try:
+        with open(LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(log, f)
+    except Exception as e:
+        print("ERROR save_log:", e)
+
+def summarize_range(start_ts: int, end_ts: int):
+    online = 0
+    offline = 0
+    log = _read_log()
+
+    for e in log:
+        ts = int(e.get("timestamp", 0))
+        if start_ts <= ts < end_ts:
+            if e.get("state"):
+                online += int(e.get("duration", 0))
+            else:
+                offline += int(e.get("duration", 0))
+
+    return online, offline
+
+def summarize(days: int):
+    now = int(time.time())
+    return summarize_range(now - days * 86400, now)
+
+def prev_month_range(now: datetime):
+    """
+    Прошлый календарный месяц:
+    start = 1-е число прошлого месяца 00:00
+    end   = 1-е число текущего месяца 00:00
+    """
+    first_this = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    last_prev = first_this - timedelta(days=1)
+    first_prev = last_prev.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return first_prev, first_this
 
 # ================== MONITOR ==================
 
 async def monitor():
     global last_online_state, last_change_time, pending_state, pending_time
-
     load_state()
-    print("🤖 Моніторинг ONLINE / OFFLINE запущено")
+    print("🤖 monitor started")
 
     while True:
         try:
@@ -247,17 +267,18 @@ async def monitor():
                 elif now - pending_time >= DEBOUNCE_INTERVAL:
                     duration = int(now - last_change_time)
 
+                    # тут ДНИ НЕ НУЖНЫ — только HH:MM
                     msg = (
-                        f"💡 Світло зʼявилось\n🌑 Темрява: {format_duration(duration)}"
+                        f"💡 Світло зʼявилось\n🌑 Було: {format_hhmm(duration)}"
                         if pending_state
                         else
-                        f"❌ Світло зникло\n⏱ Світло було: {format_duration(duration)}"
+                        f"❌ Світло зникло\n⚡ Було: {format_hhmm(duration)}"
                     )
 
                     try:
                         await bot.send_message(CHAT_ID, msg)
                     except Exception as e:
-                        print("❌ send light-change error:", e)
+                        print("send light-change error:", e)
 
                     save_log(last_online_state, duration)
 
@@ -266,175 +287,128 @@ async def monitor():
                     pending_state = None
                     pending_time = None
                     save_state()
-            else:
-                pending_state = None
-                pending_time = None
 
-            print(f"{time.strftime('%H:%M:%S')} online = {is_online}")
+            # лог статуса в консоль можно оставить
+            print(f"{datetime.now().strftime('%H:%M')} online = {is_online}")
 
         except Exception as e:
             print("ERROR monitor:", e)
 
         await asyncio.sleep(CHECK_INTERVAL)
 
-
-# ================== SUMMARY ==================
+# ================== AUTO SUMMARY ==================
 
 async def summary_scheduler():
+    """
+    - Неделя: каждый понедельник в 00:01
+    - Месяц: каждое 1-е число в 00:01 (прошлый календарный месяц)
+    """
     while True:
         try:
             now = datetime.now()
 
             if now.hour == 0 and now.minute == 1:
-                if now.weekday() == 0:
-                    online, offline = summarize(7)
-                    try:
-                        await bot.send_message(
-                            CHAT_ID,
-                            f"📊 Підсумки за тиждень:\nONLINE {format_duration(online)}, OFFLINE {format_duration(offline)}"
-                        )
-                    except Exception as e:
-                        print("❌ send auto summary_week error:", e)
-
-                    await asyncio.sleep(61)
-                    continue
-
-                online, offline = summarize(1)
-                try:
+                # Месяц — 1-го числа
+                if now.day == 1:
+                    s, e = prev_month_range(now)
+                    o, f = summarize_range(int(s.timestamp()), int(e.timestamp()))
+                    label = s.strftime("%Y-%m")
                     await bot.send_message(
                         CHAT_ID,
-                        f"📊 Підсумки за день:\nONLINE {format_duration(online)}, OFFLINE {format_duration(offline)}"
+                        f"📊 Місяць {label}\nONLINE {format_days_hhmm(o)} / OFFLINE {format_days_hhmm(f)}"
                     )
-                except Exception as e:
-                    print("❌ send auto summary_day error:", e)
+
+                # Неделя — понедельник
+                if now.weekday() == 0:
+                    o, f = summarize(7)
+                    await bot.send_message(
+                        CHAT_ID,
+                        f"📊 Тиждень\nONLINE {format_days_hhmm(o)} / OFFLINE {format_days_hhmm(f)}"
+                    )
 
                 await asyncio.sleep(61)
-                continue
 
         except Exception as e:
-            print("ERROR summary:", e)
+            print("ERROR summary_scheduler:", e)
 
         await asyncio.sleep(30)
 
+# ================== COMMANDS ==================
 
-# ================== WEBHOOK ==================
-
-async def set_telegram_webhook():
-    webhook_url = f"{PUBLIC_URL.rstrip('/')}/webhook"
-
-    info_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getWebhookInfo"
-    set_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
-
-    async with httpx.AsyncClient(timeout=15) as client:
-        info = (await client.get(info_url)).json()
-        current = (info.get("result") or {}).get("url", "")
-
-        if current == webhook_url:
-            print("✅ Webhook вже встановлено (нічого не міняю)")
-            return
-
-        payload = {
-            "url": webhook_url,
-            "drop_pending_updates": True,
-            "secret_token": WEBHOOK_SECRET,
-        }
-        r = await client.post(set_url, json=payload)
-        data = r.json()
-        if not data.get("ok"):
-            raise RuntimeError(f"setWebhook failed: {data}")
-
-        print("✅ Webhook встановлено")
-
-
-async def handle_update_safe(update: dict):
-    try:
-        await handle_update(update)
-    except Exception as e:
-        print("ERROR handle_update:", e)
-
-
-def build_help_text() -> str:
+def help_text() -> str:
     return (
-        "🛠 Команди:\n"
-        "/status — поточний статус (ONLINE/OFFLINE + тривалість)\n"
-        "/uptime — скільки працює бот\n"
-        "/last_change — коли останній раз змінився стан\n"
-        "/summary_day — підсумок за 24 години\n"
-        "/summary_week — підсумок за 7 днів\n"
-        "/help — ця підказка"
+        "/status\n"
+        "/uptime\n"
+        "/last_change\n"
+        "/summary_day\n"
+        "/summary_week\n"
+        "/summary_month\n"
+        "/help"
     )
 
-
 async def handle_update(update: dict):
-    message = update.get("message") or update.get("edited_message")
-    if not message:
+    msg = update.get("message") or update.get("edited_message")
+    if not msg:
         return
 
-    chat_id = (message.get("chat") or {}).get("id")
-    raw = (message.get("text") or "")
-    cmd = normalize_cmd(raw)
-
-    if cmd:
-        print(f"📩 cmd={cmd} chat_id={chat_id}")
-
-    # Обробляємо тільки потрібний чат
+    chat_id = (msg.get("chat") or {}).get("id")
     if chat_id != CHAT_ID:
         return
 
+    cmd = normalize_cmd(msg.get("text", ""))
+
     try:
         if cmd == "/help":
-            await bot.send_message(CHAT_ID, build_help_text())
+            await bot.send_message(CHAT_ID, help_text())
 
         elif cmd == "/status":
-            now = time.time()
-            if last_online_state is None or last_change_time is None:
-                text = "ℹ️ Статус ще не визначено"
+            if last_change_time is None or last_online_state is None:
+                await bot.send_message(CHAT_ID, "Статус ще невідомий")
             else:
-                state_text = "ONLINE ⚡" if last_online_state else "OFFLINE 🌑"
-                duration = format_duration(int(now - last_change_time))
-                text = (
-                    f"📡 Поточний статус:\n"
-                    f"{state_text}\n"
-                    f"⏱ У цьому стані: {duration}"
-                )
-            await bot.send_message(CHAT_ID, text)
+                d = format_hhmm(int(time.time() - last_change_time))  # без дней
+                s = "ONLINE ⚡" if last_online_state else "OFFLINE 🌑"
+                await bot.send_message(CHAT_ID, f"{s}\nУ цьому стані: {d}")
 
         elif cmd == "/uptime":
-            up = format_duration(int(time.time() - START_TS))
-            await bot.send_message(CHAT_ID, f"⏱ Uptime: {up}")
+            await bot.send_message(CHAT_ID, f"Uptime: {format_hhmm(int(time.time() - START_TS))}")
 
         elif cmd == "/last_change":
-            if last_change_time is None or last_online_state is None:
-                await bot.send_message(CHAT_ID, "ℹ️ Ще немає даних про зміни стану")
-            else:
-                state_text = "ONLINE ⚡" if last_online_state else "OFFLINE 🌑"
-                await bot.send_message(
-                    CHAT_ID,
-                    f"🕒 Остання зміна:\n{state_text}\n{ts_to_str(last_change_time)}"
-                )
+            if last_change_time:
+                await bot.send_message(CHAT_ID, f"Остання зміна:\n{ts_to_str(last_change_time)}")
 
         elif cmd == "/summary_day":
             o, f = summarize(1)
+            # день — БЕЗ дней
             await bot.send_message(
                 CHAT_ID,
-                f"📊 За день:\nONLINE {format_duration(o)}, OFFLINE {format_duration(f)}"
+                f"День\nONLINE {format_hhmm(o)} / OFFLINE {format_hhmm(f)}"
             )
 
         elif cmd == "/summary_week":
             o, f = summarize(7)
+            # неделя — С днями (но 0д скрываем)
             await bot.send_message(
                 CHAT_ID,
-                f"📊 За тиждень:\nONLINE {format_duration(o)}, OFFLINE {format_duration(f)}"
+                f"Тиждень\nONLINE {format_days_hhmm(o)} / OFFLINE {format_days_hhmm(f)}"
+            )
+
+        elif cmd == "/summary_month":
+            s, e = prev_month_range(datetime.now())
+            o, f = summarize_range(int(s.timestamp()), int(e.timestamp()))
+            label = s.strftime("%Y-%m")
+            # месяц — С днями (но 0д скрываем)
+            await bot.send_message(
+                CHAT_ID,
+                f"Місяць {label}\nONLINE {format_days_hhmm(o)} / OFFLINE {format_days_hhmm(f)}"
             )
 
     except Exception as e:
-        print("❌ command handler error:", e)
+        print("ERROR handle_update:", e)
 
+# ================== WEBHOOK ==================
 
 async def webhook_handler(request: web.Request):
-    secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if secret_header != WEBHOOK_SECRET:
-        print("❌ webhook: bad secret header")
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
         return web.Response(status=403, text="forbidden")
 
     try:
@@ -442,37 +416,37 @@ async def webhook_handler(request: web.Request):
     except Exception:
         return web.Response(status=400, text="bad json")
 
-    asyncio.create_task(handle_update_safe(update))
+    asyncio.create_task(handle_update(update))
     return web.Response(text="ok")
 
+async def set_webhook():
+    url = f"{PUBLIC_URL.rstrip('/')}/webhook"
+    api = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
+    payload = {"url": url, "secret_token": WEBHOOK_SECRET, "drop_pending_updates": True}
 
-async def start_web_server():
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(api, json=payload)
+        data = r.json()
+        if not data.get("ok"):
+            raise RuntimeError(f"setWebhook failed: {data}")
+
+async def start_server():
     app = web.Application()
     app.router.add_post("/webhook", webhook_handler)
-
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    print(f"✅ Web server слухає порт {PORT}")
-
-    while True:
-        await asyncio.sleep(3600)
-
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+    print(f"✅ web server on {PORT}")
 
 # ================== MAIN ==================
 
 async def main():
-    print(f"✅ START: CHAT_ID expected = {CHAT_ID}")
-
-    server_task = asyncio.create_task(start_web_server())
-    await asyncio.sleep(1)
-    await set_telegram_webhook()
-
+    print(f"✅ START chat_id={CHAT_ID}, locale={LOCALE}")
+    await start_server()
+    await set_webhook()
     await asyncio.gather(
         monitor(),
-        summary_scheduler(),
-        server_task
+        summary_scheduler()
     )
 
 if __name__ == "__main__":
