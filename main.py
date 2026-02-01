@@ -9,7 +9,7 @@ from telegram import Bot
 from datetime import datetime, timedelta
 
 # ================== НАЛАШТУВАННЯ ==================
-TELEGRAM_TOKEN = "8548566635:AAG8MvDAMvFsfp-9pKBOyP2yv7rThmhfmnM"
+TELEGRAM_TOKEN = "8548566635:AAGqg3gmUtUo8JwRMDgQQ6ODo9_cSXKZQ5g"
 CHAT_ID = 287224456
 ACCESS_ID = "9gecmcdum9rj8q7uymgc"
 ACCESS_SECRET = "058a6a9bbe7d4beb800e65500822f413"
@@ -306,3 +306,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
