@@ -22,16 +22,14 @@ ACCESS_SECRET = os.getenv("ACCESS_SECRET", "").strip() or "058a6a9bbe7d4beb800e6
 DEVICE_ID = os.getenv("DEVICE_ID", "").strip() or "bfa197db4a74f16983d2ru"
 REGION = os.getenv("REGION", "eu").strip()
 
-# Для webhook:
-# PUBLIC_URL — твой публичный домен Railway вида https://xxxxx.up.railway.app
+# Webhook
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip()
 if not PUBLIC_URL:
-    raise ValueError("❌ PUBLIC_URL не задан. Вкажи https://<твій-домен>.up.railway.app")
+    raise ValueError("❌ PUBLIC_URL не задан. Приклад: https://xxxxx.up.railway.app")
 
-# Секрет для webhook (любой сложный набор символов)
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 if not WEBHOOK_SECRET:
-    raise ValueError("❌ WEBHOOK_SECRET не задан. Додай його в Variables (будь-який складний рядок)")
+    raise ValueError("❌ WEBHOOK_SECRET не задан. Додай будь-який складний рядок у Variables")
 
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -46,6 +44,7 @@ LOG_FILE = os.path.join(BASE_DIR, "log.json")
 # ==================================================
 
 bot = Bot(token=TELEGRAM_TOKEN)
+
 access_token = None
 token_expire_at = 0
 
@@ -234,7 +233,13 @@ async def monitor():
                         f"❌ Світло зникло\n⏱ Світло було: {format_duration(duration)}"
                     )
 
-                    await bot.send_message(CHAT_ID, msg)
+                    try:
+                        print("➡️ sending light-change message...")
+                        await bot.send_message(CHAT_ID, msg)
+                        print("✅ sent light-change message")
+                    except Exception as e:
+                        print("❌ send light-change error:", e)
+
                     save_log(last_online_state, duration)
 
                     last_online_state = pending_state
@@ -258,8 +263,8 @@ async def monitor():
 
 async def summary_scheduler():
     """
-    Каждый день в 00:01 — дневной отчёт.
-    Каждый понедельник в 00:01 — недельный отчёт.
+    Кожен день о 00:01 — підсумок за день.
+    Кожен понеділок о 00:01 — підсумок за тиждень.
     """
     while True:
         try:
@@ -268,18 +273,30 @@ async def summary_scheduler():
             if now.hour == 0 and now.minute == 1:
                 if now.weekday() == 0:
                     online, offline = summarize(7)
-                    await bot.send_message(
-                        CHAT_ID,
-                        f"📊 Підсумки за тиждень:\nONLINE {format_duration(online)}, OFFLINE {format_duration(offline)}"
-                    )
+                    try:
+                        print("➡️ sending auto summary_week...")
+                        await bot.send_message(
+                            CHAT_ID,
+                            f"📊 Підсумки за тиждень:\nONLINE {format_duration(online)}, OFFLINE {format_duration(offline)}"
+                        )
+                        print("✅ sent auto summary_week")
+                    except Exception as e:
+                        print("❌ send auto summary_week error:", e)
+
                     await asyncio.sleep(61)
                     continue
 
                 online, offline = summarize(1)
-                await bot.send_message(
-                    CHAT_ID,
-                    f"📊 Підсумки за день:\nONLINE {format_duration(online)}, OFFLINE {format_duration(offline)}"
-                )
+                try:
+                    print("➡️ sending auto summary_day...")
+                    await bot.send_message(
+                        CHAT_ID,
+                        f"📊 Підсумки за день:\nONLINE {format_duration(online)}, OFFLINE {format_duration(offline)}"
+                    )
+                    print("✅ sent auto summary_day")
+                except Exception as e:
+                    print("❌ send auto summary_day error:", e)
+
                 await asyncio.sleep(61)
                 continue
 
@@ -292,7 +309,6 @@ async def summary_scheduler():
 # ================== WEBHOOK ==================
 
 async def set_telegram_webhook():
-    # URL БЕЗ секрета в пути (секрет будет только в заголовке)
     webhook_url = f"{PUBLIC_URL.rstrip('/')}/webhook"
 
     info_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getWebhookInfo"
@@ -309,7 +325,7 @@ async def set_telegram_webhook():
         payload = {
             "url": webhook_url,
             "drop_pending_updates": True,
-            "secret_token": WEBHOOK_SECRET,  # Telegram будет слать этот секрет в заголовке
+            "secret_token": WEBHOOK_SECRET,
         }
         r = await client.post(set_url, json=payload)
         data = r.json()
@@ -334,35 +350,40 @@ async def handle_update(update: dict):
     chat_id = (message.get("chat") or {}).get("id")
     text = (message.get("text") or "").strip()
 
-    # Логируем, чтобы понять что реально приходит
     if text:
         print(f"📩 incoming: chat_id={chat_id} text={text}")
 
-    # Проверка на нужный чат
     if chat_id != CHAT_ID:
         return
 
     if text == "/summary_day":
         o, f = summarize(1)
-        await bot.send_message(
-            CHAT_ID,
-            f"📊 За день:\nONLINE {format_duration(o)}, OFFLINE {format_duration(f)}"
-        )
+        try:
+            print("➡️ sending summary_day...")
+            await bot.send_message(
+                CHAT_ID,
+                f"📊 За день:\nONLINE {format_duration(o)}, OFFLINE {format_duration(f)}"
+            )
+            print("✅ sent summary_day")
+        except Exception as e:
+            print("❌ send summary_day error:", e)
 
     elif text == "/summary_week":
         o, f = summarize(7)
-        await bot.send_message(
-            CHAT_ID,
-            f"📊 За тиждень:\nONLINE {format_duration(o)}, OFFLINE {format_duration(f)}"
-        )
+        try:
+            print("➡️ sending summary_week...")
+            await bot.send_message(
+                CHAT_ID,
+                f"📊 За тиждень:\nONLINE {format_duration(o)}, OFFLINE {format_duration(f)}"
+            )
+            print("✅ sent summary_week")
+        except Exception as e:
+            print("❌ send summary_week error:", e)
 
 
-async def webhook_handler(request):
-    # Проверяем секрет из заголовка Telegram
+async def webhook_handler(request: web.Request):
     secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-
     if secret_header != WEBHOOK_SECRET:
-        # ВАЖНО: логируем, иначе ты не поймёшь, что это оно
         print("❌ webhook: bad secret header")
         return web.Response(status=403, text="forbidden")
 
@@ -371,7 +392,6 @@ async def webhook_handler(request):
     except Exception:
         return web.Response(status=400, text="bad json")
 
-    # Быстро отвечаем Telegram, обработку делаем отдельно
     asyncio.create_task(handle_update_safe(update))
     return web.Response(text="ok")
 
@@ -390,18 +410,15 @@ async def start_web_server():
         await asyncio.sleep(3600)
 
 
-
 # ================== MAIN ==================
 
 async def main():
-    # 1) Поднимаем веб-сервер
     server_task = asyncio.create_task(start_web_server())
 
-    # 2) Ставим webhook (после старта сервера)
+    # Дамо серверу секунду піднятись
     await asyncio.sleep(1)
     await set_telegram_webhook()
 
-    # 3) Запускаем твои фоновые задачи
     await asyncio.gather(
         monitor(),
         summary_scheduler(),
@@ -410,4 +427,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
