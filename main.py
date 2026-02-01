@@ -50,13 +50,12 @@ bot = Bot(token=TELEGRAM_TOKEN)
 access_token = None
 token_expire_at = 0
 
-last_online_state = None
+last_online_state = None   # True=Світло, False=Темрява
 last_change_time = None
 pending_state = None
 pending_time = None
 
 START_TS = time.time()
-
 
 # ================== TIME FORMAT (NO SECONDS) ==================
 
@@ -70,6 +69,11 @@ def hhmm(seconds: int) -> str:
     return f"{h:02}:{m:02}"
 
 def days_hhmm(seconds: int) -> str:
+    """
+    Для тижня/місяця:
+    - якщо days == 0 -> HH:MM
+    - якщо days > 0  -> 'Xdн HH:MM' або 'Xdays HH:MM'
+    """
     minutes = int(seconds) // 60
     days = minutes // (24 * 60)
     rest = minutes % (24 * 60)
@@ -86,7 +90,6 @@ def normalize_cmd(text: str) -> str:
     if not text:
         return ""
     return text.strip().split()[0].split("@")[0].lower()
-
 
 # ================== TUYA ==================
 
@@ -154,7 +157,6 @@ async def get_device_online_status() -> bool:
             raise RuntimeError(data)
         return bool(data["result"]["online"])
 
-
 # ================== STATE ==================
 
 def load_state():
@@ -167,7 +169,6 @@ def load_state():
         last_online_state = d.get("online")
         last_change_time = d.get("timestamp")
     except Exception:
-        # тихо: production без зайвого шуму
         pass
 
 def save_state():
@@ -176,7 +177,6 @@ def save_state():
             json.dump({"online": last_online_state, "timestamp": last_change_time}, f)
     except Exception:
         pass
-
 
 # ================== LOG ==================
 
@@ -193,7 +193,7 @@ def save_log(state: bool, duration: int):
     log = _read_log()
     log.append({
         "timestamp": int(time.time()),
-        "state": bool(state),
+        "state": bool(state),      # True=Світло, False=Темрява
         "duration": int(duration),
     })
 
@@ -207,19 +207,19 @@ def save_log(state: bool, duration: int):
         pass
 
 def summarize_range(start_ts: int, end_ts: int):
-    online = 0
-    offline = 0
+    light = 0
+    dark = 0
     log = _read_log()
 
     for e in log:
         ts = int(e.get("timestamp", 0))
         if start_ts <= ts < end_ts:
             if e.get("state"):
-                online += int(e.get("duration", 0))
+                light += int(e.get("duration", 0))
             else:
-                offline += int(e.get("duration", 0))
+                dark += int(e.get("duration", 0))
 
-    return online, offline
+    return light, dark
 
 def summarize(days: int):
     now = int(time.time())
@@ -231,6 +231,10 @@ def prev_month_range(now: datetime):
     first_prev = last_prev.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     return first_prev, first_this
 
+# ================== TEXT HELPERS ==================
+
+def state_line(is_light: bool) -> str:
+    return "Світло 💡" if is_light else "Темрява 🌑"
 
 # ================== MONITOR ==================
 
@@ -240,28 +244,28 @@ async def monitor():
 
     while True:
         try:
-            online = await get_device_online_status()
+            is_light = await get_device_online_status()
             now = time.time()
 
             if last_online_state is None:
-                last_online_state = online
+                last_online_state = is_light
                 last_change_time = now
                 save_state()
 
-            elif online != last_online_state:
-                if pending_state != online:
-                    pending_state = online
+            elif is_light != last_online_state:
+                if pending_state != is_light:
+                    pending_state = is_light
                     pending_time = now
 
                 elif now - pending_time >= DEBOUNCE_INTERVAL:
                     dur = int(now - last_change_time)
 
-                    # Тут ДНІ НЕ потрібні — тільки HH:MM
+                    # Без днів — тільки HH:MM
                     msg = (
-                        f"💡 Світло зʼявилось\n🌑 Було без світла: {hhmm(dur)}"
+                        f"💡 Світло зʼявилось\n🌑 Темрява: {hhmm(dur)}"
                         if pending_state
                         else
-                        f"❌ Світло зникло\n⚡ Було зі світлом: {hhmm(dur)}"
+                        f"❌ Світло зникло\n💡 Час світла: {hhmm(dur)}"
                     )
 
                     try:
@@ -286,7 +290,6 @@ async def monitor():
 
         await asyncio.sleep(CHECK_INTERVAL)
 
-
 # ================== AUTO SUMMARY ==================
 
 async def summary_scheduler():
@@ -302,23 +305,27 @@ async def summary_scheduler():
                 # Місяць (1-го числа)
                 if now.day == 1:
                     s, e = prev_month_range(now)
-                    o, f = summarize_range(int(s.timestamp()), int(e.timestamp()))
+                    light, dark = summarize_range(int(s.timestamp()), int(e.timestamp()))
                     label = s.strftime("%Y-%m")
                     try:
                         await bot.send_message(
                             CHAT_ID,
-                            f"📅 Підсумки за місяць {label}\n🟢 ONLINE {days_hhmm(o)}\n🔴 OFFLINE {days_hhmm(f)}"
+                            f"📅 Підсумки за місяць {label}\n"
+                            f"💡 Світло {days_hhmm(light)}\n"
+                            f"🌑 Темрява {days_hhmm(dark)}"
                         )
                     except Exception:
                         pass
 
                 # Тиждень (понеділок)
                 if now.weekday() == 0:
-                    o, f = summarize(7)
+                    light, dark = summarize(7)
                     try:
                         await bot.send_message(
                             CHAT_ID,
-                            f"📅 Підсумки за тиждень\n🟢 ONLINE {days_hhmm(o)}\n🔴 OFFLINE {days_hhmm(f)}"
+                            f"📅 Підсумки за тиждень\n"
+                            f"💡 Світло {days_hhmm(light)}\n"
+                            f"🌑 Темрява {days_hhmm(dark)}"
                         )
                     except Exception:
                         pass
@@ -329,7 +336,6 @@ async def summary_scheduler():
             pass
 
         await asyncio.sleep(30)
-
 
 # ================== COMMANDS ==================
 
@@ -365,55 +371,52 @@ async def handle_update(update: dict):
             if last_online_state is None or last_change_time is None:
                 await bot.send_message(CHAT_ID, "📡 Поточний статус:\nℹ️ Ще немає даних")
             else:
-                state = "ONLINE ⚡" if last_online_state else "OFFLINE 🌑"
                 dur = hhmm(int(time.time() - last_change_time))
                 await bot.send_message(
                     CHAT_ID,
-                    f"📡 Поточний статус:\n{state}\n⏱ У цьому стані: {dur}"
+                    f"📡 Поточний статус:\n{state_line(last_online_state)}\n⏱ У цьому стані: {dur}"
                 )
 
         elif cmd == "/last_change":
             if last_online_state is None or last_change_time is None:
                 await bot.send_message(CHAT_ID, "🕒 Остання зміна:\nℹ️ Ще немає даних")
             else:
-                state = "ONLINE ⚡" if last_online_state else "OFFLINE 🌑"
                 await bot.send_message(
                     CHAT_ID,
-                    f"🕒 Остання зміна:\n{state}\n{ts_hm(last_change_time)}"
+                    f"🕒 Остання зміна:\n{state_line(last_online_state)}\n{ts_hm(last_change_time)}"
                 )
 
         elif cmd == "/uptime":
             await bot.send_message(CHAT_ID, f"⏳ Uptime: {hhmm(int(time.time() - START_TS))}")
 
         elif cmd == "/summary_day":
-            o, f = summarize(1)
+            light, dark = summarize(1)
             # День — без днів
             await bot.send_message(
                 CHAT_ID,
-                f"📊 За день:\n🟢 ONLINE {hhmm(o)}\n🔴 OFFLINE {hhmm(f)}"
+                f"📊 За день:\n💡 Світло {hhmm(light)}\n🌑 Темрява {hhmm(dark)}"
             )
 
         elif cmd == "/summary_week":
-            o, f = summarize(7)
-            # Тиждень — з днями (0дн не показуємо)
+            light, dark = summarize(7)
+            # Тиждень — з днями (0дн/0days не показуємо)
             await bot.send_message(
                 CHAT_ID,
-                f"📊 За тиждень:\n🟢 ONLINE {days_hhmm(o)}\n🔴 OFFLINE {days_hhmm(f)}"
+                f"📊 За тиждень:\n💡 Світло {days_hhmm(light)}\n🌑 Темрява {days_hhmm(dark)}"
             )
 
         elif cmd == "/summary_month":
             s, e = prev_month_range(datetime.now())
-            o, f = summarize_range(int(s.timestamp()), int(e.timestamp()))
+            light, dark = summarize_range(int(s.timestamp()), int(e.timestamp()))
             label = s.strftime("%Y-%m")
-            # Місяць — з днями (0дн не показуємо)
+            # Місяць — з днями (0дн/0days не показуємо)
             await bot.send_message(
                 CHAT_ID,
-                f"📊 За місяць {label}:\n🟢 ONLINE {days_hhmm(o)}\n🔴 OFFLINE {days_hhmm(f)}"
+                f"📊 За місяць {label}:\n💡 Світло {days_hhmm(light)}\n🌑 Темрява {days_hhmm(dark)}"
             )
 
     except Exception:
         pass
-
 
 # ================== WEBHOOK ==================
 
@@ -446,7 +449,6 @@ async def start_server():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
-
 
 # ================== MAIN ==================
 
