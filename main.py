@@ -348,15 +348,28 @@ async def handle_update(update: dict):
         return
 
     chat_id = (message.get("chat") or {}).get("id")
-    text = (message.get("text") or "").strip()
 
+    raw = (message.get("text") or "")
+    text = raw.strip()
+
+    # ВАЖЛИВО: показуємо raw точно, щоб побачити приховані символи або @botname
+    if raw:
+        print(f"📩 incoming: chat_id={chat_id} raw={raw!r}")
+
+    # Нормалізуємо команду:
+    # 1) беремо перше слово
+    # 2) відрізаємо @botname
+    # 3) lowercase
+    cmd = ""
     if text:
-        print(f"📩 incoming: chat_id={chat_id} text={text}")
+        cmd = text.split()[0]
+        cmd = cmd.split("@")[0].lower()
 
+    # Обробляємо тільки потрібний чат
     if chat_id != CHAT_ID:
         return
 
-    if text == "/summary_day":
+    if cmd == "/summary_day":
         o, f = summarize(1)
         try:
             print("➡️ sending summary_day...")
@@ -368,7 +381,7 @@ async def handle_update(update: dict):
         except Exception as e:
             print("❌ send summary_day error:", e)
 
-    elif text == "/summary_week":
+    elif cmd == "/summary_week":
         o, f = summarize(7)
         try:
             print("➡️ sending summary_week...")
