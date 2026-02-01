@@ -229,7 +229,7 @@ async def monitor():
                         f"💡 Світло зʼявилось\n🌑 Темрява: {format_duration(duration)}"
                         if pending_state
                         else
-                        f"❌ Світло зникло\n⏱ Світло було: {format_duration(duration)}"
+                        f"❌ Світло зникло\n⏱ Час світла: {format_duration(duration)}"
                     )
 
                     try:
@@ -428,3 +428,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
