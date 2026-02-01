@@ -292,39 +292,56 @@ async def summary_scheduler():
 # ================== WEBHOOK ==================
 
 async def set_telegram_webhook():
-    """
-    Регистрируем webhook при старте контейнера.
-    """
-    webhook_url = f"{PUBLIC_URL.rstrip('/')}/webhook/{WEBHOOK_SECRET}"
-    api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
+    # URL БЕЗ секрета в пути (секрет будет только в заголовке)
+    webhook_url = f"{PUBLIC_URL.rstrip('/')}/webhook"
 
-    payload = {
-        "url": webhook_url,
-        "drop_pending_updates": True,
-        "secret_token": WEBHOOK_SECRET,  # Telegram будет слать этот секрет в заголовке
-    }
+    info_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getWebhookInfo"
+    set_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
 
     async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(api_url, json=payload)
+        info = (await client.get(info_url)).json()
+        current = (info.get("result") or {}).get("url", "")
+
+        if current == webhook_url:
+            print("✅ Webhook вже встановлено (нічого не міняю)")
+            return
+
+        payload = {
+            "url": webhook_url,
+            "drop_pending_updates": True,
+            "secret_token": WEBHOOK_SECRET,  # Telegram будет слать этот секрет в заголовке
+        }
+        r = await client.post(set_url, json=payload)
         data = r.json()
         if not data.get("ok"):
             raise RuntimeError(f"setWebhook failed: {data}")
-        print(f"✅ Webhook встановлено: {webhook_url}")
+
+        print("✅ Webhook встановлено")
+
+
+async def handle_update_safe(update: dict):
+    try:
+        await handle_update(update)
+    except Exception as e:
+        print("ERROR handle_update:", e)
+
 
 async def handle_update(update: dict):
-    """
-    Обработка входящих апдейтов Telegram.
-    """
     message = update.get("message") or update.get("edited_message")
     if not message:
         return
 
-    chat = message.get("chat", {})
-    chat_id = chat.get("id")
+    chat_id = (message.get("chat") or {}).get("id")
+    text = (message.get("text") or "").strip()
+
+    # Логируем, чтобы понять что реально приходит
+    if text:
+        print(f"📩 incoming: chat_id={chat_id} text={text}")
+
+    # Проверка на нужный чат
     if chat_id != CHAT_ID:
         return
 
-    text = (message.get("text") or "").strip()
     if text == "/summary_day":
         o, f = summarize(1)
         await bot.send_message(
@@ -339,10 +356,14 @@ async def handle_update(update: dict):
             f"📊 За тиждень:\nONLINE {format_duration(o)}, OFFLINE {format_duration(f)}"
         )
 
-async def webhook_handler(request: web.Request):
+
+async def webhook_handler(request):
     # Проверяем секрет из заголовка Telegram
     secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+
     if secret_header != WEBHOOK_SECRET:
+        # ВАЖНО: логируем, иначе ты не поймёшь, что это оно
+        print("❌ webhook: bad secret header")
         return web.Response(status=403, text="forbidden")
 
     try:
@@ -350,13 +371,14 @@ async def webhook_handler(request: web.Request):
     except Exception:
         return web.Response(status=400, text="bad json")
 
-    # Быстро отвечаем Telegram "OK", а обработку делаем асинхронно
-    asyncio.create_task(handle_update(update))
+    # Быстро отвечаем Telegram, обработку делаем отдельно
+    asyncio.create_task(handle_update_safe(update))
     return web.Response(text="ok")
+
 
 async def start_web_server():
     app = web.Application()
-    app.router.add_post(f"/webhook/{WEBHOOK_SECRET}", webhook_handler)
+    app.router.add_post("/webhook", webhook_handler)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -364,9 +386,9 @@ async def start_web_server():
     await site.start()
     print(f"✅ Web server слухає порт {PORT}")
 
-    # держим сервер живым
     while True:
         await asyncio.sleep(3600)
+
 
 
 # ================== MAIN ==================
@@ -388,3 +410,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
