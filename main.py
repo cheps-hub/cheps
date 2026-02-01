@@ -22,7 +22,6 @@ ACCESS_SECRET = os.getenv("ACCESS_SECRET", "").strip() or "058a6a9bbe7d4beb800e6
 DEVICE_ID = os.getenv("DEVICE_ID", "").strip() or "bfa197db4a74f16983d2ru"
 REGION = os.getenv("REGION", "eu").strip()
 
-# Webhook
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip()
 if not PUBLIC_URL:
     raise ValueError("❌ PUBLIC_URL не задан. Приклад: https://xxxxx.up.railway.app")
@@ -262,10 +261,6 @@ async def monitor():
 # ================== SUMMARY ==================
 
 async def summary_scheduler():
-    """
-    Кожен день о 00:01 — підсумок за день.
-    Кожен понеділок о 00:01 — підсумок за тиждень.
-    """
     while True:
         try:
             now = datetime.now()
@@ -348,25 +343,18 @@ async def handle_update(update: dict):
         return
 
     chat_id = (message.get("chat") or {}).get("id")
-
     raw = (message.get("text") or "")
     text = raw.strip()
 
-    # ВАЖЛИВО: показуємо raw точно, щоб побачити приховані символи або @botname
     if raw:
-        print(f"📩 incoming: chat_id={chat_id} raw={raw!r}")
+        print(f"📩 incoming: chat_id={chat_id} expected={CHAT_ID} raw={raw!r}")
 
-    # Нормалізуємо команду:
-    # 1) беремо перше слово
-    # 2) відрізаємо @botname
-    # 3) lowercase
     cmd = ""
     if text:
-        cmd = text.split()[0]
-        cmd = cmd.split("@")[0].lower()
+        cmd = text.split()[0].split("@")[0].lower()
 
-    # Обробляємо тільки потрібний чат
     if chat_id != CHAT_ID:
+        print("⚠️ chat mismatch -> ignore")
         return
 
     if cmd == "/summary_day":
@@ -426,9 +414,9 @@ async def start_web_server():
 # ================== MAIN ==================
 
 async def main():
-    server_task = asyncio.create_task(start_web_server())
+    print(f"✅ START: CHAT_ID expected = {CHAT_ID}")
 
-    # Дамо серверу секунду піднятись
+    server_task = asyncio.create_task(start_web_server())
     await asyncio.sleep(1)
     await set_telegram_webhook()
 
