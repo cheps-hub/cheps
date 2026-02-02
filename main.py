@@ -35,7 +35,7 @@ LOCALE = os.getenv("LOCALE", "ru").strip().lower()
 
 PORT = int(os.getenv("PORT", "8080"))
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "10"))
 DEBOUNCE_INTERVAL = int(os.getenv("DEBOUNCE_INTERVAL", "20"))
 MAX_LOG_DAYS = int(os.getenv("MAX_LOG_DAYS", "60"))
 
@@ -462,4 +462,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
