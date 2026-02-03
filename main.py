@@ -301,7 +301,7 @@ async def summary_scheduler():
         try:
             now = datetime.now()
 
-            if now.hour == 0 and now.minute == 1:
+            if now.hour == 8 and now.minute == 0:
                 # Місяць (1-го числа)
                 if now.day == 1:
                     s, e = prev_month_range(now)
@@ -462,5 +462,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
