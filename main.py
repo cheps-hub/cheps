@@ -7,6 +7,7 @@ import os
 import httpx
 from telegram import Bot
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from aiohttp import web
 
 # ================== ENV / SETTINGS ==================
@@ -45,6 +46,8 @@ LOG_FILE = os.path.join(BASE_DIR, "log.json")
 
 # ====================================================
 
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
 bot = Bot(token=TELEGRAM_TOKEN)
 
 access_token = None
@@ -54,6 +57,8 @@ last_online_state = None   # True=Світло, False=Темрява
 last_change_time = None
 pending_state = None
 pending_time = None
+
+last_daily_summary_date = None  # YYYY-MM-DD
 
 START_TS = time.time()
 
@@ -160,7 +165,7 @@ async def get_device_online_status() -> bool:
 # ================== STATE ==================
 
 def load_state():
-    global last_online_state, last_change_time
+    global last_online_state, last_change_time, last_daily_summary_date
     if not os.path.exists(STATE_FILE):
         return
     try:
@@ -168,13 +173,21 @@ def load_state():
             d = json.load(f)
         last_online_state = d.get("online")
         last_change_time = d.get("timestamp")
+        last_daily_summary_date = d.get("last_daily_summary_date")
     except Exception:
         pass
 
 def save_state():
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"online": last_online_state, "timestamp": last_change_time}, f)
+            json.dump(
+                {
+                    "online": last_online_state,
+                    "timestamp": last_change_time,
+                    "last_daily_summary_date": last_daily_summary_date,
+                },
+                f
+            )
     except Exception:
         pass
 
@@ -260,7 +273,6 @@ async def monitor():
                 elif now - pending_time >= DEBOUNCE_INTERVAL:
                     dur = int(now - last_change_time)
 
-                    # Без днів — тільки HH:MM
                     msg = (
                         f"💡 Світло зʼявилось\n🌑 Темрява була: {hhmm(dur)}"
                         if pending_state
@@ -294,48 +306,72 @@ async def monitor():
 
 async def summary_scheduler():
     """
-    - Тиждень: кожен понеділок 00:01
-    - Місяць: кожне 1-е число 00:01 (попередній календарний місяць)
+    Щодня: 08:00 (Kyiv) — підсумок за останні 24 години
+    Тиждень: понеділок 08:00 (Kyiv)
+    Місяць: 1-е число 08:00 (Kyiv) за попередній календарний місяць
     """
+    global last_daily_summary_date
+
     while True:
         try:
-            now = datetime.now()
+            now = datetime.now(KYIV_TZ)
+            today = now.strftime("%Y-%m-%d")
 
-            if now.hour == 8 and now.minute == 0:
+            # вікно 08:00–08:04, щоб не пропускати через sleep/інтервали
+            in_window = (now.hour == 8 and 0 <= now.minute <= 4)
+
+            if in_window and last_daily_summary_date != today:
+                # День (останні 24 години)
+                light, dark = summarize(1)
+                try:
+                    await bot.send_message(
+                        CHAT_ID,
+                        f"📊 Підсумки за день\n"
+                        f"💡 Світло {hhmm(light)}\n"
+                        f"🌑 Темрява {hhmm(dark)}"
+                    )
+                except Exception:
+                    pass
+
                 # Місяць (1-го числа)
                 if now.day == 1:
                     s, e = prev_month_range(now)
-                    light, dark = summarize_range(int(s.timestamp()), int(e.timestamp()))
+                    light_m, dark_m = summarize_range(int(s.timestamp()), int(e.timestamp()))
                     label = s.strftime("%Y-%m")
                     try:
                         await bot.send_message(
                             CHAT_ID,
                             f"📅 Підсумки за місяць {label}\n"
-                            f"💡 Світло {days_hhmm(light)}\n"
-                            f"🌑 Темрява {days_hhmm(dark)}"
+                            f"💡 Світло {days_hhmm(light_m)}\n"
+                            f"🌑 Темрява {days_hhmm(dark_m)}"
                         )
                     except Exception:
                         pass
 
                 # Тиждень (понеділок)
                 if now.weekday() == 0:
-                    light, dark = summarize(7)
+                    light_w, dark_w = summarize(7)
                     try:
                         await bot.send_message(
                             CHAT_ID,
                             f"📅 Підсумки за тиждень\n"
-                            f"💡 Світло {days_hhmm(light)}\n"
-                            f"🌑 Темрява {days_hhmm(dark)}"
+                            f"💡 Світло {days_hhmm(light_w)}\n"
+                            f"🌑 Темрява {days_hhmm(dark_w)}"
                         )
                     except Exception:
                         pass
 
-                await asyncio.sleep(61)
+                # зафіксували, що сьогодні вже відправили
+                last_daily_summary_date = today
+                save_state()
+
+                # додатковий антиспам, навіть якщо цикл прокинеться знову у вікні
+                await asyncio.sleep(120)
 
         except Exception:
             pass
 
-        await asyncio.sleep(30)
+        await asyncio.sleep(20)
 
 # ================== COMMANDS ==================
 
@@ -391,7 +427,6 @@ async def handle_update(update: dict):
 
         elif cmd == "/summary_day":
             light, dark = summarize(1)
-            # День — без днів
             await bot.send_message(
                 CHAT_ID,
                 f"📊 За день:\n💡 Світло {hhmm(light)}\n🌑 Темрява {hhmm(dark)}"
@@ -399,17 +434,15 @@ async def handle_update(update: dict):
 
         elif cmd == "/summary_week":
             light, dark = summarize(7)
-            # Тиждень — з днями (0дн/0days не показуємо)
             await bot.send_message(
                 CHAT_ID,
                 f"📊 За тиждень:\n💡 Світло {days_hhmm(light)}\n🌑 Темрява {days_hhmm(dark)}"
             )
 
         elif cmd == "/summary_month":
-            s, e = prev_month_range(datetime.now())
+            s, e = prev_month_range(datetime.now(KYIV_TZ))
             light, dark = summarize_range(int(s.timestamp()), int(e.timestamp()))
             label = s.strftime("%Y-%m")
-            # Місяць — з днями (0дн/0days не показуємо)
             await bot.send_message(
                 CHAT_ID,
                 f"📊 За місяць {label}:\n💡 Світло {days_hhmm(light)}\n🌑 Темрява {days_hhmm(dark)}"
@@ -453,6 +486,7 @@ async def start_server():
 # ================== MAIN ==================
 
 async def main():
+    print("KYIV now:", datetime.now(KYIV_TZ).isoformat())
     await start_server()
     await set_webhook()
     await asyncio.gather(
@@ -462,6 +496,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
