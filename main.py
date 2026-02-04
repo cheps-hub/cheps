@@ -40,6 +40,10 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "10"))
 DEBOUNCE_INTERVAL = int(os.getenv("DEBOUNCE_INTERVAL", "20"))
 MAX_LOG_DAYS = int(os.getenv("MAX_LOG_DAYS", "60"))
 
+# DEBUG/TEST
+SCHEDULER_LOG_EVERY_SECONDS = int(os.getenv("SCHEDULER_LOG_EVERY_SECONDS", "60"))
+FORCE_DAILY_ON_START = os.getenv("FORCE_DAILY_ON_START", "0").strip() == "1"
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BASE_DIR, "state.json")
 LOG_FILE = os.path.join(BASE_DIR, "log.json")
@@ -304,34 +308,61 @@ async def monitor():
 
 # ================== AUTO SUMMARY ==================
 
-async def summary_scheduler():
+async def send_daily_summary(now: datetime):
     """
-    Щодня: 08:00 (Kyiv) — підсумок за останні 24 години
-    Тиждень: понеділок 08:00 (Kyiv)
-    Місяць: 1-е число 08:00 (Kyiv) за попередній календарний місяць
+    Відправляє підсумок за останні 24 години і оновлює last_daily_summary_date.
     """
     global last_daily_summary_date
+    today = now.strftime("%Y-%m-%d")
+
+    light, dark = summarize(1)
+    print("SENDING DAILY SUMMARY", today)
+
+    try:
+        await bot.send_message(
+            CHAT_ID,
+            f"📊 Підсумки за день\n"
+            f"💡 Світло {hhmm(light)}\n"
+            f"🌑 Темрява {hhmm(dark)}"
+        )
+    except Exception:
+        pass
+
+    last_daily_summary_date = today
+    save_state()
+
+async def summary_scheduler():
+    """
+    Щодня: 08:00–08:04 (Kyiv) — підсумок за день (останні 24 години)
+    Тиждень: понеділок у цьому ж вікні
+    Місяць: 1-е число у цьому ж вікні (за попередній календарний місяць)
+    """
+    global last_daily_summary_date
+    last_log_ts = 0
 
     while True:
         try:
             now = datetime.now(KYIV_TZ)
             today = now.strftime("%Y-%m-%d")
 
+            # лог кожні N секунд, щоб бачити, що scheduler "живий"
+            if time.time() - last_log_ts >= SCHEDULER_LOG_EVERY_SECONDS:
+                print("scheduler tick:", now.strftime("%Y-%m-%d %H:%M:%S"), "last_sent:", last_daily_summary_date)
+                last_log_ts = time.time()
+
             # вікно 08:00–08:04, щоб не пропускати через sleep/інтервали
             in_window = (now.hour == 8 and 0 <= now.minute <= 4)
 
+            # опційно: одноразовий тест після старту (якщо FORCE_DAILY_ON_START=1)
+            if FORCE_DAILY_ON_START and last_daily_summary_date != today:
+                print("FORCE_DAILY_ON_START=1 -> sending immediately")
+                await send_daily_summary(now)
+                # після відправки трохи поспимо, щоб не дублювати
+                await asyncio.sleep(30)
+
+            # нормальна щоденна відправка у вікні
             if in_window and last_daily_summary_date != today:
-                # День (останні 24 години)
-                light, dark = summarize(1)
-                try:
-                    await bot.send_message(
-                        CHAT_ID,
-                        f"📊 Підсумки за день\n"
-                        f"💡 Світло {hhmm(light)}\n"
-                        f"🌑 Темрява {hhmm(dark)}"
-                    )
-                except Exception:
-                    pass
+                await send_daily_summary(now)
 
                 # Місяць (1-го числа)
                 if now.day == 1:
@@ -361,11 +392,7 @@ async def summary_scheduler():
                     except Exception:
                         pass
 
-                # зафіксували, що сьогодні вже відправили
-                last_daily_summary_date = today
-                save_state()
-
-                # додатковий антиспам, навіть якщо цикл прокинеться знову у вікні
+                # антиспам у межах вікна
                 await asyncio.sleep(120)
 
         except Exception:
@@ -486,6 +513,7 @@ async def start_server():
 # ================== MAIN ==================
 
 async def main():
+    load_state()
     print("KYIV now:", datetime.now(KYIV_TZ).isoformat())
     await start_server()
     await set_webhook()
