@@ -40,10 +40,6 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "10"))
 DEBOUNCE_INTERVAL = int(os.getenv("DEBOUNCE_INTERVAL", "20"))
 MAX_LOG_DAYS = int(os.getenv("MAX_LOG_DAYS", "60"))
 
-# DEBUG/TEST
-SCHEDULER_LOG_EVERY_SECONDS = int(os.getenv("SCHEDULER_LOG_EVERY_SECONDS", "60"))
-FORCE_DAILY_ON_START = os.getenv("FORCE_DAILY_ON_START", "0").strip() == "1"
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BASE_DIR, "state.json")
 LOG_FILE = os.path.join(BASE_DIR, "log.json")
@@ -58,13 +54,21 @@ access_token = None
 token_expire_at = 0
 
 last_online_state = None   # True=Світло, False=Темрява
-last_change_time = None
+last_change_time = None    # epoch seconds when current state started
+
 pending_state = None
 pending_time = None
 
-last_daily_summary_date = None  # YYYY-MM-DD
+# calendar / scheduler guards (YYYY-MM-DD)
+last_rollover_date = None
+last_daily_summary_date = None
+last_weekly_summary_date = None
+last_monthly_summary_date = None
 
 START_TS = time.time()
+
+# lock to avoid race between monitor() and summary_scheduler()
+STATE_LOCK = asyncio.Lock()
 
 # ================== TIME FORMAT (NO SECONDS) ==================
 
@@ -78,11 +82,6 @@ def hhmm(seconds: int) -> str:
     return f"{h:02}:{m:02}"
 
 def days_hhmm(seconds: int) -> str:
-    """
-    Для тижня/місяця:
-    - якщо days == 0 -> HH:MM
-    - якщо days > 0  -> 'Xdн HH:MM' або 'Xdays HH:MM'
-    """
     minutes = int(seconds) // 60
     days = minutes // (24 * 60)
     rest = minutes % (24 * 60)
@@ -99,6 +98,40 @@ def normalize_cmd(text: str) -> str:
     if not text:
         return ""
     return text.strip().split()[0].split("@")[0].lower()
+
+def ymd(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d")
+
+# ================== CALENDAR RANGES (KYIV) ==================
+
+def start_of_day_kyiv(dt: datetime) -> datetime:
+    dt = dt.astimezone(KYIV_TZ)
+    return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+def start_of_week_kyiv(dt: datetime) -> datetime:
+    # Monday 00:00
+    d0 = start_of_day_kyiv(dt)
+    return d0 - timedelta(days=d0.weekday())
+
+def start_of_month_kyiv(dt: datetime) -> datetime:
+    d0 = start_of_day_kyiv(dt)
+    return d0.replace(day=1)
+
+def prev_day_range_kyiv(now: datetime) -> tuple[int, int]:
+    end_dt = start_of_day_kyiv(now)                 # today 00:00
+    start_dt = end_dt - timedelta(days=1)           # yesterday 00:00
+    return int(start_dt.timestamp()), int(end_dt.timestamp())
+
+def prev_week_range_kyiv(now: datetime) -> tuple[int, int]:
+    end_dt = start_of_week_kyiv(now)                # this Monday 00:00
+    start_dt = end_dt - timedelta(days=7)           # prev Monday 00:00
+    return int(start_dt.timestamp()), int(end_dt.timestamp())
+
+def prev_month_range_kyiv(now: datetime) -> tuple[int, int]:
+    end_dt = start_of_month_kyiv(now)               # first day of this month 00:00
+    prev_last_day = end_dt - timedelta(days=1)
+    start_dt = start_of_month_kyiv(prev_last_day)   # first day of prev month 00:00
+    return int(start_dt.timestamp()), int(end_dt.timestamp())
 
 # ================== TUYA ==================
 
@@ -169,7 +202,9 @@ async def get_device_online_status() -> bool:
 # ================== STATE ==================
 
 def load_state():
-    global last_online_state, last_change_time, last_daily_summary_date
+    global last_online_state, last_change_time
+    global last_rollover_date, last_daily_summary_date, last_weekly_summary_date, last_monthly_summary_date
+
     if not os.path.exists(STATE_FILE):
         return
     try:
@@ -177,7 +212,11 @@ def load_state():
             d = json.load(f)
         last_online_state = d.get("online")
         last_change_time = d.get("timestamp")
+
+        last_rollover_date = d.get("last_rollover_date")
         last_daily_summary_date = d.get("last_daily_summary_date")
+        last_weekly_summary_date = d.get("last_weekly_summary_date")
+        last_monthly_summary_date = d.get("last_monthly_summary_date")
     except Exception:
         pass
 
@@ -188,7 +227,10 @@ def save_state():
                 {
                     "online": last_online_state,
                     "timestamp": last_change_time,
+                    "last_rollover_date": last_rollover_date,
                     "last_daily_summary_date": last_daily_summary_date,
+                    "last_weekly_summary_date": last_weekly_summary_date,
+                    "last_monthly_summary_date": last_monthly_summary_date,
                 },
                 f
             )
@@ -206,11 +248,16 @@ def _read_log():
     except Exception:
         return []
 
-def save_log(state: bool, duration: int):
+def save_log(state: bool, duration: int, end_ts: int | None = None):
+    """
+    state: True=Світло, False=Темрява
+    duration: seconds
+    end_ts: epoch seconds at which this interval ended (default: now)
+    """
     log = _read_log()
     log.append({
-        "timestamp": int(time.time()),
-        "state": bool(state),      # True=Світло, False=Темрява
+        "timestamp": int(end_ts if end_ts is not None else time.time()),  # end moment of interval
+        "state": bool(state),
         "duration": int(duration),
     })
 
@@ -224,6 +271,12 @@ def save_log(state: bool, duration: int):
         pass
 
 def summarize_range(start_ts: int, end_ts: int):
+    """
+    NOTE: This is "simple" counting:
+    counts only log entries whose end timestamp is within [start_ts, end_ts)
+    and adds their full duration (no edge clipping).
+    This becomes OK in practice because we add daily rollovers at ~00:01.
+    """
     light = 0
     dark = 0
     log = _read_log()
@@ -238,16 +291,6 @@ def summarize_range(start_ts: int, end_ts: int):
 
     return light, dark
 
-def summarize(days: int):
-    now = int(time.time())
-    return summarize_range(now - days * 86400, now)
-
-def prev_month_range(now: datetime):
-    first_this = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    last_prev = first_this - timedelta(days=1)
-    first_prev = last_prev.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    return first_prev, first_this
-
 # ================== TEXT HELPERS ==================
 
 def state_line(is_light: bool) -> str:
@@ -257,143 +300,202 @@ def state_line(is_light: bool) -> str:
 
 async def monitor():
     global last_online_state, last_change_time, pending_state, pending_time
+
     load_state()
 
     while True:
         try:
             is_light = await get_device_online_status()
-            now = time.time()
+            now_ts = time.time()
 
-            if last_online_state is None:
-                last_online_state = is_light
-                last_change_time = now
-                save_state()
-
-            elif is_light != last_online_state:
-                if pending_state != is_light:
-                    pending_state = is_light
-                    pending_time = now
-
-                elif now - pending_time >= DEBOUNCE_INTERVAL:
-                    dur = int(now - last_change_time)
-
-                    msg = (
-                        f"💡 Світло зʼявилось\n🌑 Темрява була: {hhmm(dur)}"
-                        if pending_state
-                        else
-                        f"❌ Світло зникло\n💡 Час світла: {hhmm(dur)}"
-                    )
-
-                    try:
-                        await bot.send_message(CHAT_ID, msg)
-                    except Exception:
-                        pass
-
-                    save_log(last_online_state, dur)
-
-                    last_online_state = pending_state
-                    last_change_time = now
-                    pending_state = None
-                    pending_time = None
+            async with STATE_LOCK:
+                if last_online_state is None or last_change_time is None:
+                    last_online_state = is_light
+                    last_change_time = now_ts
                     save_state()
 
-            else:
-                pending_state = None
-                pending_time = None
+                elif is_light != last_online_state:
+                    if pending_state != is_light:
+                        pending_state = is_light
+                        pending_time = now_ts
+
+                    elif now_ts - pending_time >= DEBOUNCE_INTERVAL:
+                        dur = int(now_ts - last_change_time)
+
+                        msg = (
+                            f"💡 Світло зʼявилось\n🌑 Темрява була: {hhmm(dur)}"
+                            if pending_state
+                            else
+                            f"❌ Світло зникло\n💡 Час світла: {hhmm(dur)}"
+                        )
+
+                        try:
+                            await bot.send_message(CHAT_ID, msg)
+                        except Exception:
+                            pass
+
+                        # log the interval that just ended (previous state)
+                        save_log(last_online_state, dur, end_ts=int(now_ts))
+
+                        last_online_state = pending_state
+                        last_change_time = now_ts
+                        pending_state = None
+                        pending_time = None
+                        save_state()
+
+                else:
+                    pending_state = None
+                    pending_time = None
 
         except Exception:
             pass
 
         await asyncio.sleep(CHECK_INTERVAL)
 
-# ================== AUTO SUMMARY ==================
+# ================== DAILY ROLLOVER (00:01) ==================
+
+async def daily_rollover_if_needed(now: datetime):
+    """
+    At ~00:01 Kyiv: close the current interval into log and start a new one.
+    This ensures day/week/month summaries include "ongoing" time.
+    """
+    global last_online_state, last_change_time, last_rollover_date
+
+    today = ymd(now)
+
+    # window 00:01–00:04
+    in_window = (now.hour == 0 and 1 <= now.minute <= 4)
+    if not in_window:
+        return
+
+    async with STATE_LOCK:
+        if last_rollover_date == today:
+            return
+
+    # fetch actual status once (tolerance is ok; this prevents drifting)
+    try:
+        current_is_light = await get_device_online_status()
+    except Exception:
+        return
+
+    now_ts = time.time()
+
+    async with STATE_LOCK:
+        # initialize if needed
+        if last_online_state is None or last_change_time is None:
+            last_online_state = current_is_light
+            last_change_time = now_ts
+            last_rollover_date = today
+            save_state()
+            return
+
+        # close current interval up to now_ts
+        dur = int(now_ts - last_change_time)
+        if dur > 0:
+            save_log(last_online_state, dur, end_ts=int(now_ts))
+
+        # start new interval from now
+        last_online_state = current_is_light
+        last_change_time = now_ts
+
+        # mark rollover done
+        last_rollover_date = today
+        save_state()
+
+# ================== AUTO SUMMARY (08:00) ==================
 
 async def send_daily_summary(now: datetime):
-    """
-    Відправляє підсумок за останні 24 години і оновлює last_daily_summary_date.
-    """
     global last_daily_summary_date
-    today = now.strftime("%Y-%m-%d")
-
-    light, dark = summarize(1)
-    print("SENDING DAILY SUMMARY", today)
+    start_ts, end_ts = prev_day_range_kyiv(now)
+    light, dark = summarize_range(start_ts, end_ts)
 
     try:
         await bot.send_message(
             CHAT_ID,
-            f"📊 Підсумки за день\n"
+            "📊 Підсумки за день (00:00→00:00)\n"
             f"💡 Світло {hhmm(light)}\n"
             f"🌑 Темрява {hhmm(dark)}"
         )
     except Exception:
         pass
 
-    last_daily_summary_date = today
+    last_daily_summary_date = ymd(now)
+    save_state()
+
+async def send_weekly_summary(now: datetime):
+    global last_weekly_summary_date
+    start_ts, end_ts = prev_week_range_kyiv(now)
+    light, dark = summarize_range(start_ts, end_ts)
+
+    try:
+        await bot.send_message(
+            CHAT_ID,
+            "📅 Підсумки за тиждень (Пн 00:00→Пн 00:00)\n"
+            f"💡 Світло {days_hhmm(light)}\n"
+            f"🌑 Темрява {days_hhmm(dark)}"
+        )
+    except Exception:
+        pass
+
+    last_weekly_summary_date = ymd(now)
+    save_state()
+
+async def send_monthly_summary(now: datetime):
+    global last_monthly_summary_date
+    start_ts, end_ts = prev_month_range_kyiv(now)
+    # label = prev month YYYY-MM
+    prev_month_label = datetime.fromtimestamp(start_ts, KYIV_TZ).strftime("%Y-%m")
+
+    light, dark = summarize_range(start_ts, end_ts)
+
+    try:
+        await bot.send_message(
+            CHAT_ID,
+            f"📅 Підсумки за місяць {prev_month_label} (1-е 00:00→1-е 00:00)\n"
+            f"💡 Світло {days_hhmm(light)}\n"
+            f"🌑 Темрява {days_hhmm(dark)}"
+        )
+    except Exception:
+        pass
+
+    last_monthly_summary_date = ymd(now)
     save_state()
 
 async def summary_scheduler():
     """
-    Щодня: 08:00–08:04 (Kyiv) — підсумок за день (останні 24 години)
-    Тиждень: понеділок у цьому ж вікні
-    Місяць: 1-е число у цьому ж вікні (за попередній календарний місяць)
+    00:01 Kyiv: daily rollover (close ongoing interval)
+    08:00 Kyiv: send daily; Monday send weekly; 1st send monthly
     """
-    global last_daily_summary_date
-    last_log_ts = 0
+    global last_daily_summary_date, last_weekly_summary_date, last_monthly_summary_date
+
+    load_state()
 
     while True:
         try:
             now = datetime.now(KYIV_TZ)
-            today = now.strftime("%Y-%m-%d")
+            today = ymd(now)
 
-            # лог кожні N секунд, щоб бачити, що scheduler "живий"
-            if time.time() - last_log_ts >= SCHEDULER_LOG_EVERY_SECONDS:
-                print("scheduler tick:", now.strftime("%Y-%m-%d %H:%M:%S"), "last_sent:", last_daily_summary_date)
-                last_log_ts = time.time()
+            # 1) rollover around midnight
+            await daily_rollover_if_needed(now)
 
-            # вікно 08:00–08:04, щоб не пропускати через sleep/інтервали
-            in_window = (now.hour == 8 and 0 <= now.minute <= 4)
+            # 2) summary window 08:00–08:04
+            in_summary_window = (now.hour == 8 and 0 <= now.minute <= 4)
 
-            # опційно: одноразовий тест після старту (якщо FORCE_DAILY_ON_START=1)
-            if FORCE_DAILY_ON_START and last_daily_summary_date != today:
-                print("FORCE_DAILY_ON_START=1 -> sending immediately")
-                await send_daily_summary(now)
-                # після відправки трохи поспимо, щоб не дублювати
-                await asyncio.sleep(30)
+            if in_summary_window:
+                # daily (once per day)
+                if last_daily_summary_date != today:
+                    await send_daily_summary(now)
 
-            # нормальна щоденна відправка у вікні
-            if in_window and last_daily_summary_date != today:
-                await send_daily_summary(now)
+                # weekly on Monday (once that day)
+                if now.weekday() == 0 and last_weekly_summary_date != today:
+                    await send_weekly_summary(now)
 
-                # Місяць (1-го числа)
-                if now.day == 1:
-                    s, e = prev_month_range(now)
-                    light_m, dark_m = summarize_range(int(s.timestamp()), int(e.timestamp()))
-                    label = s.strftime("%Y-%m")
-                    try:
-                        await bot.send_message(
-                            CHAT_ID,
-                            f"📅 Підсумки за місяць {label}\n"
-                            f"💡 Світло {days_hhmm(light_m)}\n"
-                            f"🌑 Темрява {days_hhmm(dark_m)}"
-                        )
-                    except Exception:
-                        pass
+                # monthly on 1st (once that day)
+                if now.day == 1 and last_monthly_summary_date != today:
+                    await send_monthly_summary(now)
 
-                # Тиждень (понеділок)
-                if now.weekday() == 0:
-                    light_w, dark_w = summarize(7)
-                    try:
-                        await bot.send_message(
-                            CHAT_ID,
-                            f"📅 Підсумки за тиждень\n"
-                            f"💡 Світло {days_hhmm(light_w)}\n"
-                            f"🌑 Темрява {days_hhmm(dark_w)}"
-                        )
-                    except Exception:
-                        pass
-
-                # антиспам у межах вікна
-                await asyncio.sleep(120)
+                # anti-spam inside window
+                await asyncio.sleep(90)
 
         except Exception:
             pass
@@ -431,48 +533,61 @@ async def handle_update(update: dict):
             await bot.send_message(CHAT_ID, help_text())
 
         elif cmd == "/status":
-            if last_online_state is None or last_change_time is None:
-                await bot.send_message(CHAT_ID, "📡 Поточний статус:\nℹ️ Ще немає даних")
-            else:
-                dur = hhmm(int(time.time() - last_change_time))
-                await bot.send_message(
-                    CHAT_ID,
-                    f"📡 Поточний статус:\n{state_line(last_online_state)}\n⏱ У цьому стані: {dur}"
-                )
+            async with STATE_LOCK:
+                if last_online_state is None or last_change_time is None:
+                    await bot.send_message(CHAT_ID, "📡 Поточний статус:\nℹ️ Ще немає даних")
+                else:
+                    dur = hhmm(int(time.time() - last_change_time))
+                    await bot.send_message(
+                        CHAT_ID,
+                        f"📡 Поточний статус:\n{state_line(last_online_state)}\n⏱ У цьому стані: {dur}"
+                    )
 
         elif cmd == "/last_change":
-            if last_online_state is None or last_change_time is None:
-                await bot.send_message(CHAT_ID, "🕒 Остання зміна:\nℹ️ Ще немає даних")
-            else:
-                await bot.send_message(
-                    CHAT_ID,
-                    f"🕒 Остання зміна:\n{state_line(last_online_state)}\n{ts_hm(last_change_time)}"
-                )
+            async with STATE_LOCK:
+                if last_online_state is None or last_change_time is None:
+                    await bot.send_message(CHAT_ID, "🕒 Остання зміна:\nℹ️ Ще немає даних")
+                else:
+                    await bot.send_message(
+                        CHAT_ID,
+                        f"🕒 Остання зміна:\n{state_line(last_online_state)}\n{ts_hm(last_change_time)}"
+                    )
 
         elif cmd == "/uptime":
             await bot.send_message(CHAT_ID, f"⏳ Uptime: {hhmm(int(time.time() - START_TS))}")
 
         elif cmd == "/summary_day":
-            light, dark = summarize(1)
+            now = datetime.now(KYIV_TZ)
+            start_ts, end_ts = prev_day_range_kyiv(now)
+            light, dark = summarize_range(start_ts, end_ts)
             await bot.send_message(
                 CHAT_ID,
-                f"📊 За день:\n💡 Світло {hhmm(light)}\n🌑 Темрява {hhmm(dark)}"
+                "📊 За день (вчора 00:00→сьогодні 00:00):\n"
+                f"💡 Світло {hhmm(light)}\n"
+                f"🌑 Темрява {hhmm(dark)}"
             )
 
         elif cmd == "/summary_week":
-            light, dark = summarize(7)
+            now = datetime.now(KYIV_TZ)
+            start_ts, end_ts = prev_week_range_kyiv(now)
+            light, dark = summarize_range(start_ts, end_ts)
             await bot.send_message(
                 CHAT_ID,
-                f"📊 За тиждень:\n💡 Світло {days_hhmm(light)}\n🌑 Темрява {days_hhmm(dark)}"
+                "📊 За тиждень (попередній Пн→Пн):\n"
+                f"💡 Світло {days_hhmm(light)}\n"
+                f"🌑 Темрява {days_hhmm(dark)}"
             )
 
         elif cmd == "/summary_month":
-            s, e = prev_month_range(datetime.now(KYIV_TZ))
-            light, dark = summarize_range(int(s.timestamp()), int(e.timestamp()))
-            label = s.strftime("%Y-%m")
+            now = datetime.now(KYIV_TZ)
+            start_ts, end_ts = prev_month_range_kyiv(now)
+            label = datetime.fromtimestamp(start_ts, KYIV_TZ).strftime("%Y-%m")
+            light, dark = summarize_range(start_ts, end_ts)
             await bot.send_message(
                 CHAT_ID,
-                f"📊 За місяць {label}:\n💡 Світло {days_hhmm(light)}\n🌑 Темрява {days_hhmm(dark)}"
+                f"📊 За місяць {label} (попередній):\n"
+                f"💡 Світло {days_hhmm(light)}\n"
+                f"🌑 Темрява {days_hhmm(dark)}"
             )
 
     except Exception:
