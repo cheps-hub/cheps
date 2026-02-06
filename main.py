@@ -53,13 +53,14 @@ bot = Bot(token=TELEGRAM_TOKEN)
 access_token = None
 token_expire_at = 0
 
-last_online_state = None   # True=Світло, False=Темрява
-last_change_time = None    # epoch seconds when current state started
+last_online_state = None      # True=Світло, False=Темрява (останній відомий стан)
+last_change_time = None       # epoch seconds: час ОСТАННЬОЇ РЕАЛЬНОЇ зміни (для /status)
+segment_start_time = None     # epoch seconds: старт поточного "сегмента" для логів/звітів
 
 pending_state = None
 pending_time = None
 
-# calendar / scheduler guards (YYYY-MM-DD)
+# scheduler guards (YYYY-MM-DD)
 last_rollover_date = None
 last_daily_summary_date = None
 last_weekly_summary_date = None
@@ -67,7 +68,6 @@ last_monthly_summary_date = None
 
 START_TS = time.time()
 
-# lock to avoid race between monitor() and summary_scheduler()
 STATE_LOCK = asyncio.Lock()
 
 # ================== TIME FORMAT (NO SECONDS) ==================
@@ -109,28 +109,27 @@ def start_of_day_kyiv(dt: datetime) -> datetime:
     return dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
 def start_of_week_kyiv(dt: datetime) -> datetime:
-    # Monday 00:00
     d0 = start_of_day_kyiv(dt)
-    return d0 - timedelta(days=d0.weekday())
+    return d0 - timedelta(days=d0.weekday())  # Monday 00:00
 
 def start_of_month_kyiv(dt: datetime) -> datetime:
     d0 = start_of_day_kyiv(dt)
     return d0.replace(day=1)
 
 def prev_day_range_kyiv(now: datetime) -> tuple[int, int]:
-    end_dt = start_of_day_kyiv(now)                 # today 00:00
-    start_dt = end_dt - timedelta(days=1)           # yesterday 00:00
+    end_dt = start_of_day_kyiv(now)          # today 00:00
+    start_dt = end_dt - timedelta(days=1)    # yesterday 00:00
     return int(start_dt.timestamp()), int(end_dt.timestamp())
 
 def prev_week_range_kyiv(now: datetime) -> tuple[int, int]:
-    end_dt = start_of_week_kyiv(now)                # this Monday 00:00
-    start_dt = end_dt - timedelta(days=7)           # prev Monday 00:00
+    end_dt = start_of_week_kyiv(now)         # this Monday 00:00
+    start_dt = end_dt - timedelta(days=7)    # prev Monday 00:00
     return int(start_dt.timestamp()), int(end_dt.timestamp())
 
 def prev_month_range_kyiv(now: datetime) -> tuple[int, int]:
-    end_dt = start_of_month_kyiv(now)               # first day of this month 00:00
+    end_dt = start_of_month_kyiv(now)        # first day of this month 00:00
     prev_last_day = end_dt - timedelta(days=1)
-    start_dt = start_of_month_kyiv(prev_last_day)   # first day of prev month 00:00
+    start_dt = start_of_month_kyiv(prev_last_day)
     return int(start_dt.timestamp()), int(end_dt.timestamp())
 
 # ================== TUYA ==================
@@ -202,7 +201,7 @@ async def get_device_online_status() -> bool:
 # ================== STATE ==================
 
 def load_state():
-    global last_online_state, last_change_time
+    global last_online_state, last_change_time, segment_start_time
     global last_rollover_date, last_daily_summary_date, last_weekly_summary_date, last_monthly_summary_date
 
     if not os.path.exists(STATE_FILE):
@@ -212,6 +211,7 @@ def load_state():
             d = json.load(f)
         last_online_state = d.get("online")
         last_change_time = d.get("timestamp")
+        segment_start_time = d.get("segment_start_time")
 
         last_rollover_date = d.get("last_rollover_date")
         last_daily_summary_date = d.get("last_daily_summary_date")
@@ -227,6 +227,7 @@ def save_state():
                 {
                     "online": last_online_state,
                     "timestamp": last_change_time,
+                    "segment_start_time": segment_start_time,
                     "last_rollover_date": last_rollover_date,
                     "last_daily_summary_date": last_daily_summary_date,
                     "last_weekly_summary_date": last_weekly_summary_date,
@@ -249,14 +250,9 @@ def _read_log():
         return []
 
 def save_log(state: bool, duration: int, end_ts: int | None = None):
-    """
-    state: True=Світло, False=Темрява
-    duration: seconds
-    end_ts: epoch seconds at which this interval ended (default: now)
-    """
     log = _read_log()
     log.append({
-        "timestamp": int(end_ts if end_ts is not None else time.time()),  # end moment of interval
+        "timestamp": int(end_ts if end_ts is not None else time.time()),  # момент завершення сегмента
         "state": bool(state),
         "duration": int(duration),
     })
@@ -271,12 +267,6 @@ def save_log(state: bool, duration: int, end_ts: int | None = None):
         pass
 
 def summarize_range(start_ts: int, end_ts: int):
-    """
-    NOTE: This is "simple" counting:
-    counts only log entries whose end timestamp is within [start_ts, end_ts)
-    and adds their full duration (no edge clipping).
-    This becomes OK in practice because we add daily rollovers at ~00:01.
-    """
     light = 0
     dark = 0
     log = _read_log()
@@ -299,7 +289,7 @@ def state_line(is_light: bool) -> str:
 # ================== MONITOR ==================
 
 async def monitor():
-    global last_online_state, last_change_time, pending_state, pending_time
+    global last_online_state, last_change_time, segment_start_time, pending_state, pending_time
 
     load_state()
 
@@ -312,6 +302,7 @@ async def monitor():
                 if last_online_state is None or last_change_time is None:
                     last_online_state = is_light
                     last_change_time = now_ts
+                    segment_start_time = now_ts
                     save_state()
 
                 elif is_light != last_online_state:
@@ -320,13 +311,14 @@ async def monitor():
                         pending_time = now_ts
 
                     elif now_ts - pending_time >= DEBOUNCE_INTERVAL:
-                        dur = int(now_ts - last_change_time)
+                        # завершився попередній стан
+                        dur_for_message = int(now_ts - last_change_time)
 
                         msg = (
-                            f"💡 Світло зʼявилось\n🌑 Темрява була: {hhmm(dur)}"
+                            f"💡 Світло зʼявилось\n🌑 Темрява була: {hhmm(dur_for_message)}"
                             if pending_state
                             else
-                            f"❌ Світло зникло\n💡 Час світла: {hhmm(dur)}"
+                            f"❌ Світло зникло\n💡 Час світла: {hhmm(dur_for_message)}"
                         )
 
                         try:
@@ -334,11 +326,19 @@ async def monitor():
                         except Exception:
                             pass
 
-                        # log the interval that just ended (previous state)
-                        save_log(last_online_state, dur, end_ts=int(now_ts))
+                        # Лог для звітів: ріжемо від segment_start_time до now
+                        if segment_start_time is None:
+                            segment_start_time = last_change_time
 
+                        dur_for_log = int(now_ts - segment_start_time)
+                        if dur_for_log > 0:
+                            save_log(last_online_state, dur_for_log, end_ts=int(now_ts))
+
+                        # оновлюємо стан
                         last_online_state = pending_state
-                        last_change_time = now_ts
+                        last_change_time = now_ts        # РЕАЛЬНА зміна
+                        segment_start_time = now_ts      # новий сегмент для логів
+
                         pending_state = None
                         pending_time = None
                         save_state()
@@ -356,14 +356,15 @@ async def monitor():
 
 async def daily_rollover_if_needed(now: datetime):
     """
-    At ~00:01 Kyiv: close the current interval into log and start a new one.
-    This ensures day/week/month summaries include "ongoing" time.
+    О 00:01–00:04 (Kyiv):
+    - робимо запит статуса
+    - ДОПИСУЄМО сегмент у лог
+    - СТАВИМО segment_start_time = now
+    - НЕ чіпаємо last_change_time, якщо стан не змінився
     """
-    global last_online_state, last_change_time, last_rollover_date
+    global last_online_state, last_change_time, segment_start_time, last_rollover_date
 
     today = ymd(now)
-
-    # window 00:01–00:04
     in_window = (now.hour == 0 and 1 <= now.minute <= 4)
     if not in_window:
         return
@@ -372,7 +373,6 @@ async def daily_rollover_if_needed(now: datetime):
         if last_rollover_date == today:
             return
 
-    # fetch actual status once (tolerance is ok; this prevents drifting)
     try:
         current_is_light = await get_device_online_status()
     except Exception:
@@ -381,24 +381,38 @@ async def daily_rollover_if_needed(now: datetime):
     now_ts = time.time()
 
     async with STATE_LOCK:
-        # initialize if needed
+        # ініціалізація
         if last_online_state is None or last_change_time is None:
             last_online_state = current_is_light
             last_change_time = now_ts
+            segment_start_time = now_ts
             last_rollover_date = today
             save_state()
             return
 
-        # close current interval up to now_ts
-        dur = int(now_ts - last_change_time)
-        if dur > 0:
-            save_log(last_online_state, dur, end_ts=int(now_ts))
+        if segment_start_time is None:
+            segment_start_time = last_change_time
 
-        # start new interval from now
-        last_online_state = current_is_light
-        last_change_time = now_ts
+        # якщо статус змінився, але monitor "проспав" — трактуємо як реальну зміну зараз
+        if current_is_light != last_online_state:
+            # закриваємо попередній сегмент
+            dur = int(now_ts - segment_start_time)
+            if dur > 0:
+                save_log(last_online_state, dur, end_ts=int(now_ts))
 
-        # mark rollover done
+            # фіксуємо "реальну" зміну
+            last_online_state = current_is_light
+            last_change_time = now_ts          # бо це фактична зміна (хай і з похибкою)
+            segment_start_time = now_ts
+        else:
+            # стан той самий: ріжемо ТІЛЬКИ для звітів
+            dur = int(now_ts - segment_start_time)
+            if dur > 0:
+                save_log(last_online_state, dur, end_ts=int(now_ts))
+
+            # важливо: last_change_time НЕ чіпаємо
+            segment_start_time = now_ts
+
         last_rollover_date = today
         save_state()
 
@@ -443,7 +457,6 @@ async def send_weekly_summary(now: datetime):
 async def send_monthly_summary(now: datetime):
     global last_monthly_summary_date
     start_ts, end_ts = prev_month_range_kyiv(now)
-    # label = prev month YYYY-MM
     prev_month_label = datetime.fromtimestamp(start_ts, KYIV_TZ).strftime("%Y-%m")
 
     light, dark = summarize_range(start_ts, end_ts)
@@ -463,11 +476,9 @@ async def send_monthly_summary(now: datetime):
 
 async def summary_scheduler():
     """
-    00:01 Kyiv: daily rollover (close ongoing interval)
-    08:00 Kyiv: send daily; Monday send weekly; 1st send monthly
+    00:01–00:04 Kyiv: daily rollover (ріжемо лог, не скидаючи last_change_time)
+    08:00–08:04 Kyiv: daily; Monday weekly; 1st monthly
     """
-    global last_daily_summary_date, last_weekly_summary_date, last_monthly_summary_date
-
     load_state()
 
     while True:
@@ -475,26 +486,19 @@ async def summary_scheduler():
             now = datetime.now(KYIV_TZ)
             today = ymd(now)
 
-            # 1) rollover around midnight
             await daily_rollover_if_needed(now)
 
-            # 2) summary window 08:00–08:04
             in_summary_window = (now.hour == 8 and 0 <= now.minute <= 4)
-
             if in_summary_window:
-                # daily (once per day)
                 if last_daily_summary_date != today:
                     await send_daily_summary(now)
 
-                # weekly on Monday (once that day)
                 if now.weekday() == 0 and last_weekly_summary_date != today:
                     await send_weekly_summary(now)
 
-                # monthly on 1st (once that day)
                 if now.day == 1 and last_monthly_summary_date != today:
                     await send_monthly_summary(now)
 
-                # anti-spam inside window
                 await asyncio.sleep(90)
 
         except Exception:
