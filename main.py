@@ -426,7 +426,7 @@ async def send_daily_summary(now: datetime):
     try:
         await bot.send_message(
             CHAT_ID,
-            "📊 Підсумки за день (00:00→00:00)\n"
+            "📊 Підсумки за день \n"
             f"💡 Світло {hhmm(light)}\n"
             f"🌑 Темрява {hhmm(dark)}"
         )
@@ -444,7 +444,7 @@ async def send_weekly_summary(now: datetime):
     try:
         await bot.send_message(
             CHAT_ID,
-            "📅 Підсумки за тиждень (Пн 00:00→Пн 00:00)\n"
+            "📅 Підсумки за тиждень \n"
             f"💡 Світло {days_hhmm(light)}\n"
             f"🌑 Темрява {days_hhmm(dark)}"
         )
@@ -464,7 +464,7 @@ async def send_monthly_summary(now: datetime):
     try:
         await bot.send_message(
             CHAT_ID,
-            f"📅 Підсумки за місяць {prev_month_label} (1-е 00:00→1-е 00:00)\n"
+            f"📅 Підсумки за місяць {prev_month_label} \n"
             f"💡 Світло {days_hhmm(light)}\n"
             f"🌑 Темрява {days_hhmm(dark)}"
         )
@@ -643,3 +643,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
