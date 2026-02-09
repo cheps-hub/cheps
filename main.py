@@ -40,6 +40,9 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "10"))
 DEBOUNCE_INTERVAL = int(os.getenv("DEBOUNCE_INTERVAL", "20"))
 MAX_LOG_DAYS = int(os.getenv("MAX_LOG_DAYS", "60"))
 
+# Якщо Tuya не відповідає довше цього — вважаємо "немає світла"
+TUYA_OFFLINE_GRACE_SEC = int(os.getenv("TUYA_OFFLINE_GRACE_SEC", "30"))
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BASE_DIR, "state.json")
 LOG_FILE = os.path.join(BASE_DIR, "log.json")
@@ -47,18 +50,21 @@ LOG_FILE = os.path.join(BASE_DIR, "log.json")
 # ====================================================
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
-
 bot = Bot(token=TELEGRAM_TOKEN)
 
 access_token = None
 token_expire_at = 0
 
-last_online_state = None      # True=Світло, False=Темрява (останній відомий стан)
-last_change_time = None       # epoch seconds: час ОСТАННЬОЇ РЕАЛЬНОЇ зміни (для /status)
-segment_start_time = None     # epoch seconds: старт поточного "сегмента" для логів/звітів
+last_online_state = None      # True=Світло, False=Темрява
+last_change_time = None       # epoch seconds: час ОСТАННЬОЇ РЕАЛЬНОЇ зміни
+segment_start_time = None     # epoch seconds: старт поточного сегмента для логів/звітів
 
 pending_state = None
 pending_time = None
+
+# Tuya health
+tuya_offline_since = None     # epoch seconds або None
+last_tuya_error = None        # str або None
 
 # scheduler guards (YYYY-MM-DD)
 last_rollover_date = None
@@ -67,7 +73,6 @@ last_weekly_summary_date = None
 last_monthly_summary_date = None
 
 START_TS = time.time()
-
 STATE_LOCK = asyncio.Lock()
 
 # ================== TIME FORMAT (NO SECONDS) ==================
@@ -92,7 +97,7 @@ def days_hhmm(seconds: int) -> str:
     return f"{h:02}:{m:02}"
 
 def ts_hm(ts: float) -> str:
-    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    return datetime.fromtimestamp(ts, KYIV_TZ).strftime("%Y-%m-%d %H:%M")
 
 def normalize_cmd(text: str) -> str:
     if not text:
@@ -110,24 +115,24 @@ def start_of_day_kyiv(dt: datetime) -> datetime:
 
 def start_of_week_kyiv(dt: datetime) -> datetime:
     d0 = start_of_day_kyiv(dt)
-    return d0 - timedelta(days=d0.weekday())  # Monday 00:00
+    return d0 - timedelta(days=d0.weekday())
 
 def start_of_month_kyiv(dt: datetime) -> datetime:
     d0 = start_of_day_kyiv(dt)
     return d0.replace(day=1)
 
 def prev_day_range_kyiv(now: datetime) -> tuple[int, int]:
-    end_dt = start_of_day_kyiv(now)          # today 00:00
-    start_dt = end_dt - timedelta(days=1)    # yesterday 00:00
+    end_dt = start_of_day_kyiv(now)
+    start_dt = end_dt - timedelta(days=1)
     return int(start_dt.timestamp()), int(end_dt.timestamp())
 
 def prev_week_range_kyiv(now: datetime) -> tuple[int, int]:
-    end_dt = start_of_week_kyiv(now)         # this Monday 00:00
-    start_dt = end_dt - timedelta(days=7)    # prev Monday 00:00
+    end_dt = start_of_week_kyiv(now)
+    start_dt = end_dt - timedelta(days=7)
     return int(start_dt.timestamp()), int(end_dt.timestamp())
 
 def prev_month_range_kyiv(now: datetime) -> tuple[int, int]:
-    end_dt = start_of_month_kyiv(now)        # first day of this month 00:00
+    end_dt = start_of_month_kyiv(now)
     prev_last_day = end_dt - timedelta(days=1)
     start_dt = start_of_month_kyiv(prev_last_day)
     return int(start_dt.timestamp()), int(end_dt.timestamp())
@@ -203,15 +208,20 @@ async def get_device_online_status() -> bool:
 def load_state():
     global last_online_state, last_change_time, segment_start_time
     global last_rollover_date, last_daily_summary_date, last_weekly_summary_date, last_monthly_summary_date
+    global tuya_offline_since, last_tuya_error
 
     if not os.path.exists(STATE_FILE):
         return
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             d = json.load(f)
+
         last_online_state = d.get("online")
         last_change_time = d.get("timestamp")
         segment_start_time = d.get("segment_start_time")
+
+        tuya_offline_since = d.get("tuya_offline_since")
+        last_tuya_error = d.get("last_tuya_error")
 
         last_rollover_date = d.get("last_rollover_date")
         last_daily_summary_date = d.get("last_daily_summary_date")
@@ -221,6 +231,8 @@ def load_state():
         pass
 
 def save_state():
+    global last_online_state, last_change_time, segment_start_time
+    global tuya_offline_since, last_tuya_error
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(
@@ -228,12 +240,17 @@ def save_state():
                     "online": last_online_state,
                     "timestamp": last_change_time,
                     "segment_start_time": segment_start_time,
+
+                    "tuya_offline_since": tuya_offline_since,
+                    "last_tuya_error": last_tuya_error,
+
                     "last_rollover_date": last_rollover_date,
                     "last_daily_summary_date": last_daily_summary_date,
                     "last_weekly_summary_date": last_weekly_summary_date,
                     "last_monthly_summary_date": last_monthly_summary_date,
                 },
-                f
+                f,
+                ensure_ascii=False
             )
     except Exception:
         pass
@@ -250,19 +267,20 @@ def _read_log():
         return []
 
 def save_log(state: bool, duration: int, end_ts: int | None = None):
+    end_ts = int(end_ts if end_ts is not None else time.time())
     log = _read_log()
     log.append({
-        "timestamp": int(end_ts if end_ts is not None else time.time()),  # момент завершення сегмента
+        "timestamp": end_ts,          # момент завершення сегмента
         "state": bool(state),
         "duration": int(duration),
     })
 
-    cutoff = int(time.time()) - MAX_LOG_DAYS * 86400
+    cutoff = end_ts - MAX_LOG_DAYS * 86400
     log = [x for x in log if int(x.get("timestamp", 0)) >= cutoff]
 
     try:
         with open(LOG_FILE, "w", encoding="utf-8") as f:
-            json.dump(log, f)
+            json.dump(log, f, ensure_ascii=False)
     except Exception:
         pass
 
@@ -286,58 +304,89 @@ def summarize_range(start_ts: int, end_ts: int):
 def state_line(is_light: bool) -> str:
     return "Світло 💡" if is_light else "Темрява 🌑"
 
+# ================== BOOTSTRAP (always init) ==================
+
+async def bootstrap_if_needed():
+    """Гарантує, що в нас є хоч якийсь стан навіть якщо Tuya не працює."""
+    global last_online_state, last_change_time, segment_start_time
+    global tuya_offline_since, last_tuya_error
+
+    async with STATE_LOCK:
+        if last_online_state is not None and last_change_time is not None and segment_start_time is not None:
+            return
+
+        now_ts = time.time()
+        # Базово ініціалізуємо як "Темрява", щоб /status не був порожній.
+        last_online_state = False
+        last_change_time = now_ts
+        segment_start_time = now_ts
+
+        if tuya_offline_since is None:
+            tuya_offline_since = now_ts
+
+        if last_tuya_error is None:
+            last_tuya_error = "bootstrap: no Tuya data yet"
+
+        save_state()
+
 # ================== MONITOR ==================
 
 async def monitor():
     global last_online_state, last_change_time, segment_start_time, pending_state, pending_time
+    global tuya_offline_since, last_tuya_error
 
     load_state()
+    await bootstrap_if_needed()
 
     while True:
+        now_ts = time.time()
+
         try:
             is_light = await get_device_online_status()
-            now_ts = time.time()
 
             async with STATE_LOCK:
-                if last_online_state is None or last_change_time is None:
+                # Tuya ок
+                tuya_offline_since = None
+                last_tuya_error = None
+
+                # Якщо раптом хтось стер state
+                if last_online_state is None or last_change_time is None or segment_start_time is None:
                     last_online_state = is_light
                     last_change_time = now_ts
                     segment_start_time = now_ts
                     save_state()
 
                 elif is_light != last_online_state:
+                    # debounce логіка
                     if pending_state != is_light:
                         pending_state = is_light
                         pending_time = now_ts
 
                     elif now_ts - pending_time >= DEBOUNCE_INTERVAL:
-                        # завершився попередній стан
+                        # повідомлення про зміну
                         dur_for_message = int(now_ts - last_change_time)
-
                         msg = (
                             f"💡 Світло зʼявилось\n🌑 Темрява була: {hhmm(dur_for_message)}"
                             if pending_state
                             else
                             f"❌ Світло зникло\n💡 Час світла: {hhmm(dur_for_message)}"
                         )
-
                         try:
                             await bot.send_message(CHAT_ID, msg)
                         except Exception:
                             pass
 
-                        # Лог для звітів: ріжемо від segment_start_time до now
+                        # ЛОГ: закриваємо сегмент
                         if segment_start_time is None:
                             segment_start_time = last_change_time
-
                         dur_for_log = int(now_ts - segment_start_time)
                         if dur_for_log > 0:
                             save_log(last_online_state, dur_for_log, end_ts=int(now_ts))
 
                         # оновлюємо стан
                         last_online_state = pending_state
-                        last_change_time = now_ts        # РЕАЛЬНА зміна
-                        segment_start_time = now_ts      # новий сегмент для логів
+                        last_change_time = now_ts
+                        segment_start_time = now_ts
 
                         pending_state = None
                         pending_time = None
@@ -346,9 +395,34 @@ async def monitor():
                 else:
                     pending_state = None
                     pending_time = None
+                    # Важливо: навіть без змін ми НЕ пишемо лог постійно — лог ріжемо rollover'ом вночі
 
-        except Exception:
-            pass
+        except Exception as e:
+            # Tuya не відповідає — НЕ мовчимо і НЕ зупиняємо лічильники
+            err = str(e)
+            async with STATE_LOCK:
+                last_tuya_error = err[:4000]  # щоб не роздувалося
+                if tuya_offline_since is None:
+                    tuya_offline_since = now_ts
+
+                # якщо даних нема — ініціалізовано bootstrap'ом
+                if last_online_state is None or last_change_time is None or segment_start_time is None:
+                    await bootstrap_if_needed()
+
+                # після grace вважаємо "Темрява"
+                offline_dur = now_ts - (tuya_offline_since or now_ts)
+                if offline_dur >= TUYA_OFFLINE_GRACE_SEC:
+                    # якщо ми ще не в темряві — це "фактична" зміна
+                    if last_online_state is True:
+                        # закриваємо попередній сегмент (світло)
+                        dur_for_log = int(now_ts - (segment_start_time or now_ts))
+                        if dur_for_log > 0:
+                            save_log(True, dur_for_log, end_ts=int(now_ts))
+
+                        last_online_state = False
+                        last_change_time = now_ts
+                        segment_start_time = now_ts
+                        save_state()
 
         await asyncio.sleep(CHECK_INTERVAL)
 
@@ -357,12 +431,12 @@ async def monitor():
 async def daily_rollover_if_needed(now: datetime):
     """
     О 00:01–00:04 (Kyiv):
-    - робимо запит статуса
-    - ДОПИСУЄМО сегмент у лог
-    - СТАВИМО segment_start_time = now
-    - НЕ чіпаємо last_change_time, якщо стан не змінився
+    - ріжемо сегмент у лог по segment_start_time -> now
+    - segment_start_time = now
+    - last_change_time НЕ чіпаємо, якщо стан не змінився
     """
     global last_online_state, last_change_time, segment_start_time, last_rollover_date
+    global tuya_offline_since, last_tuya_error
 
     today = ymd(now)
     in_window = (now.hour == 0 and 1 <= now.minute <= 4)
@@ -373,44 +447,48 @@ async def daily_rollover_if_needed(now: datetime):
         if last_rollover_date == today:
             return
 
-    try:
-        current_is_light = await get_device_online_status()
-    except Exception:
-        return
+        # гарантуємо ініціалізацію
+        if last_online_state is None or last_change_time is None or segment_start_time is None:
+            await bootstrap_if_needed()
 
     now_ts = time.time()
 
-    async with STATE_LOCK:
-        # ініціалізація
-        if last_online_state is None or last_change_time is None:
-            last_online_state = current_is_light
-            last_change_time = now_ts
-            segment_start_time = now_ts
-            last_rollover_date = today
-            save_state()
-            return
+    # пробуємо Tuya, але якщо не вийде — все одно ріжемо лог по поточному стану
+    current_is_light = None
+    try:
+        current_is_light = await get_device_online_status()
+        async with STATE_LOCK:
+            tuya_offline_since = None
+            last_tuya_error = None
+    except Exception as e:
+        async with STATE_LOCK:
+            last_tuya_error = str(e)[:4000]
+            if tuya_offline_since is None:
+                tuya_offline_since = now_ts
 
+            offline_dur = now_ts - (tuya_offline_since or now_ts)
+            if offline_dur >= TUYA_OFFLINE_GRACE_SEC:
+                current_is_light = False
+            else:
+                current_is_light = last_online_state if last_online_state is not None else False
+
+    async with STATE_LOCK:
         if segment_start_time is None:
             segment_start_time = last_change_time
 
-        # якщо статус змінився, але monitor "проспав" — трактуємо як реальну зміну зараз
+        # якщо статус змінився — вважаємо зміну зараз (з похибкою)
         if current_is_light != last_online_state:
-            # закриваємо попередній сегмент
             dur = int(now_ts - segment_start_time)
             if dur > 0:
                 save_log(last_online_state, dur, end_ts=int(now_ts))
 
-            # фіксуємо "реальну" зміну
             last_online_state = current_is_light
-            last_change_time = now_ts          # бо це фактична зміна (хай і з похибкою)
+            last_change_time = now_ts
             segment_start_time = now_ts
         else:
-            # стан той самий: ріжемо ТІЛЬКИ для звітів
             dur = int(now_ts - segment_start_time)
             if dur > 0:
                 save_log(last_online_state, dur, end_ts=int(now_ts))
-
-            # важливо: last_change_time НЕ чіпаємо
             segment_start_time = now_ts
 
         last_rollover_date = today
@@ -475,11 +553,8 @@ async def send_monthly_summary(now: datetime):
     save_state()
 
 async def summary_scheduler():
-    """
-    00:01–00:04 Kyiv: daily rollover (ріжемо лог, не скидаючи last_change_time)
-    08:00–08:04 Kyiv: daily; Monday weekly; 1st monthly
-    """
     load_state()
+    await bootstrap_if_needed()
 
     while True:
         try:
@@ -521,6 +596,8 @@ def help_text() -> str:
     )
 
 async def handle_update(update: dict):
+    global tuya_offline_since, last_tuya_error
+
     msg = update.get("message") or update.get("edited_message")
     if not msg:
         return
@@ -539,23 +616,33 @@ async def handle_update(update: dict):
         elif cmd == "/status":
             async with STATE_LOCK:
                 if last_online_state is None or last_change_time is None:
-                    await bot.send_message(CHAT_ID, "📡 Поточний статус:\nℹ️ Ще немає даних")
-                else:
-                    dur = hhmm(int(time.time() - last_change_time))
-                    await bot.send_message(
-                        CHAT_ID,
-                        f"📡 Поточний статус:\n{state_line(last_online_state)}\n⏱ У цьому стані: {dur}"
-                    )
+                    await bootstrap_if_needed()
+
+                dur = hhmm(int(time.time() - (last_change_time or time.time())))
+                offline_txt = "00:00"
+                if tuya_offline_since is not None:
+                    offline_txt = hhmm(int(time.time() - tuya_offline_since))
+
+                extra = ""
+                if tuya_offline_since is not None:
+                    extra += f"\n⚠️ Tuya OFFLINE: {offline_txt}\n(після {TUYA_OFFLINE_GRACE_SEC}с OFFLINE вважаємо: немає світла)"
+                if last_tuya_error:
+                    extra += f"\n🧾 Tuya error: {last_tuya_error[:200]}"
+
+                await bot.send_message(
+                    CHAT_ID,
+                    f"📡 Поточний статус:\n{state_line(bool(last_online_state))}\n⏱ У цьому стані: {dur}{extra}"
+                )
 
         elif cmd == "/last_change":
             async with STATE_LOCK:
                 if last_online_state is None or last_change_time is None:
-                    await bot.send_message(CHAT_ID, "🕒 Остання зміна:\nℹ️ Ще немає даних")
-                else:
-                    await bot.send_message(
-                        CHAT_ID,
-                        f"🕒 Остання зміна:\n{state_line(last_online_state)}\n{ts_hm(last_change_time)}"
-                    )
+                    await bootstrap_if_needed()
+
+                await bot.send_message(
+                    CHAT_ID,
+                    f"🕒 Остання зміна:\n{state_line(bool(last_online_state))}\n{ts_hm(last_change_time)}"
+                )
 
         elif cmd == "/uptime":
             await bot.send_message(CHAT_ID, f"⏳ Uptime: {hhmm(int(time.time() - START_TS))}")
@@ -633,6 +720,7 @@ async def start_server():
 
 async def main():
     load_state()
+    await bootstrap_if_needed()
     print("KYIV now:", datetime.now(KYIV_TZ).isoformat())
     await start_server()
     await set_webhook()
