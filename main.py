@@ -40,6 +40,9 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "10"))
 DEBOUNCE_INTERVAL = int(os.getenv("DEBOUNCE_INTERVAL", "20"))
 MAX_LOG_DAYS = int(os.getenv("MAX_LOG_DAYS", "60"))
 
+# OFFLINE = немає світла (після таймауту)
+OFFLINE_TIMEOUT = int(os.getenv("OFFLINE_TIMEOUT", "30"))  # секунд
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BASE_DIR, "state.json")
 LOG_FILE = os.path.join(BASE_DIR, "log.json")
@@ -53,12 +56,17 @@ bot = Bot(token=TELEGRAM_TOKEN)
 access_token = None
 token_expire_at = 0
 
-last_online_state = None      # True=Світло, False=Темрява (останній відомий стан)
-last_change_time = None       # epoch seconds: час ОСТАННЬОЇ РЕАЛЬНОЇ зміни (для /status)
+last_online_state = None      # True=Світло, False=Темрява (останній відомий/прийнятий стан)
+last_change_time = None       # epoch seconds: час ОСТАННЬОЇ РЕАЛЬНОЇ (або примусової OFFLINE) зміни (для /status)
 segment_start_time = None     # epoch seconds: старт поточного "сегмента" для логів/звітів
 
 pending_state = None
 pending_time = None
+
+# Tuya reachability tracking
+tuya_online = True            # чи Tuya відповідає зараз
+offline_since = None          # epoch seconds: коли вперше помітили недоступність
+last_seen = None              # epoch seconds: коли востаннє Tuya точно відповідала
 
 # scheduler guards (YYYY-MM-DD)
 last_rollover_date = None
@@ -178,6 +186,11 @@ async def get_access_token():
         token_expire_at = time.time() + data["result"]["expire_time"] - 60
 
 async def get_device_online_status() -> bool:
+    """
+    Повертає поле result.online від Tuya.
+    У цій системі: online=True => Світло; online=False => Темрява.
+    Якщо запит падає — викликає Exception (ми обробляємо вище як OFFLINE).
+    """
     global access_token
     if not DEVICE_ID:
         raise ValueError("DEVICE_ID not set")
@@ -203,15 +216,22 @@ async def get_device_online_status() -> bool:
 def load_state():
     global last_online_state, last_change_time, segment_start_time
     global last_rollover_date, last_daily_summary_date, last_weekly_summary_date, last_monthly_summary_date
+    global tuya_online, offline_since, last_seen
 
     if not os.path.exists(STATE_FILE):
         return
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             d = json.load(f)
+
         last_online_state = d.get("online")
         last_change_time = d.get("timestamp")
         segment_start_time = d.get("segment_start_time")
+
+        # new fields
+        tuya_online = d.get("tuya_online", True)
+        offline_since = d.get("offline_since")
+        last_seen = d.get("last_seen")
 
         last_rollover_date = d.get("last_rollover_date")
         last_daily_summary_date = d.get("last_daily_summary_date")
@@ -228,6 +248,11 @@ def save_state():
                     "online": last_online_state,
                     "timestamp": last_change_time,
                     "segment_start_time": segment_start_time,
+
+                    "tuya_online": tuya_online,
+                    "offline_since": offline_since,
+                    "last_seen": last_seen,
+
                     "last_rollover_date": last_rollover_date,
                     "last_daily_summary_date": last_daily_summary_date,
                     "last_weekly_summary_date": last_weekly_summary_date,
@@ -290,65 +315,132 @@ def state_line(is_light: bool) -> str:
 
 async def monitor():
     global last_online_state, last_change_time, segment_start_time, pending_state, pending_time
+    global tuya_online, offline_since, last_seen
 
     load_state()
 
     while True:
+        now_ts = time.time()
+        tuya_ok = False
+        is_light = None  # type: ignore
+
         try:
             is_light = await get_device_online_status()
-            now_ts = time.time()
+            tuya_ok = True
+        except Exception:
+            tuya_ok = False
 
-            async with STATE_LOCK:
-                if last_online_state is None or last_change_time is None:
-                    last_online_state = is_light
+        async with STATE_LOCK:
+            # init if needed (без зміни логіки)
+            if last_online_state is None or last_change_time is None:
+                # якщо Tuya не відповідає з першого старту — вважаємо "немає світла" після таймауту,
+                # але стартовий стан ставимо обережно як False (бо тобі треба OFFLINE=немає світла)
+                last_online_state = bool(is_light) if tuya_ok else False
+                last_change_time = now_ts
+                segment_start_time = now_ts
+                tuya_online = tuya_ok
+                last_seen = now_ts if tuya_ok else last_seen
+                offline_since = None if tuya_ok else (offline_since or now_ts)
+                save_state()
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+
+            # update tuya reachability
+            if tuya_ok:
+                tuya_online = True
+                last_seen = now_ts
+                offline_since = None
+            else:
+                tuya_online = False
+                if offline_since is None:
+                    offline_since = now_ts
+
+            # effective state rule: OFFLINE >= timeout => "немає світла" (False)
+            forced_offline = False
+            effective_is_light = None
+
+            if tuya_ok:
+                effective_is_light = bool(is_light)
+            else:
+                # ще чекаємо timeout, щоб не спамити при коротких збоях
+                offline_age = now_ts - float(offline_since or now_ts)
+                if offline_age >= OFFLINE_TIMEOUT:
+                    forced_offline = True
+                    effective_is_light = False
+                else:
+                    # до таймауту не змінюємо стан, просто чекаємо
+                    effective_is_light = last_online_state
+
+            # якщо спрацював OFFLINE timeout і ми були в "Світло" — робимо миттєве переключення
+            if forced_offline and last_online_state is True:
+                # завершився попередній стан
+                dur_for_message = int(now_ts - last_change_time)
+                msg = f"❌ Світло зникло\n💡 Час світла: {hhmm(dur_for_message)}"
+
+                try:
+                    await bot.send_message(CHAT_ID, msg)
+                except Exception:
+                    pass
+
+                if segment_start_time is None:
+                    segment_start_time = last_change_time
+
+                dur_for_log = int(now_ts - segment_start_time)
+                if dur_for_log > 0:
+                    save_log(last_online_state, dur_for_log, end_ts=int(now_ts))
+
+                last_online_state = False
+                last_change_time = now_ts
+                segment_start_time = now_ts
+
+                pending_state = None
+                pending_time = None
+                save_state()
+
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+
+            # звичайна логіка змін (debounce)
+            if effective_is_light != last_online_state:
+                if pending_state != effective_is_light:
+                    pending_state = effective_is_light
+                    pending_time = now_ts
+
+                elif pending_time is not None and now_ts - pending_time >= DEBOUNCE_INTERVAL:
+                    dur_for_message = int(now_ts - last_change_time)
+
+                    msg = (
+                        f"💡 Світло зʼявилось\n🌑 Темрява була: {hhmm(dur_for_message)}"
+                        if pending_state
+                        else
+                        f"❌ Світло зникло\n💡 Час світла: {hhmm(dur_for_message)}"
+                    )
+
+                    try:
+                        await bot.send_message(CHAT_ID, msg)
+                    except Exception:
+                        pass
+
+                    if segment_start_time is None:
+                        segment_start_time = last_change_time
+
+                    dur_for_log = int(now_ts - segment_start_time)
+                    if dur_for_log > 0:
+                        save_log(last_online_state, dur_for_log, end_ts=int(now_ts))
+
+                    last_online_state = pending_state
                     last_change_time = now_ts
                     segment_start_time = now_ts
-                    save_state()
 
-                elif is_light != last_online_state:
-                    if pending_state != is_light:
-                        pending_state = is_light
-                        pending_time = now_ts
-
-                    elif now_ts - pending_time >= DEBOUNCE_INTERVAL:
-                        # завершився попередній стан
-                        dur_for_message = int(now_ts - last_change_time)
-
-                        msg = (
-                            f"💡 Світло зʼявилось\n🌑 Темрява була: {hhmm(dur_for_message)}"
-                            if pending_state
-                            else
-                            f"❌ Світло зникло\n💡 Час світла: {hhmm(dur_for_message)}"
-                        )
-
-                        try:
-                            await bot.send_message(CHAT_ID, msg)
-                        except Exception:
-                            pass
-
-                        # Лог для звітів: ріжемо від segment_start_time до now
-                        if segment_start_time is None:
-                            segment_start_time = last_change_time
-
-                        dur_for_log = int(now_ts - segment_start_time)
-                        if dur_for_log > 0:
-                            save_log(last_online_state, dur_for_log, end_ts=int(now_ts))
-
-                        # оновлюємо стан
-                        last_online_state = pending_state
-                        last_change_time = now_ts        # РЕАЛЬНА зміна
-                        segment_start_time = now_ts      # новий сегмент для логів
-
-                        pending_state = None
-                        pending_time = None
-                        save_state()
-
-                else:
                     pending_state = None
                     pending_time = None
+                    save_state()
 
-        except Exception:
-            pass
+            else:
+                pending_state = None
+                pending_time = None
+
+            save_state()
 
         await asyncio.sleep(CHECK_INTERVAL)
 
@@ -357,12 +449,13 @@ async def monitor():
 async def daily_rollover_if_needed(now: datetime):
     """
     О 00:01–00:04 (Kyiv):
-    - робимо запит статуса
+    - робимо запит статуса (або OFFLINE-logic)
     - ДОПИСУЄМО сегмент у лог
     - СТАВИМО segment_start_time = now
     - НЕ чіпаємо last_change_time, якщо стан не змінився
     """
     global last_online_state, last_change_time, segment_start_time, last_rollover_date
+    global tuya_online, offline_since, last_seen
 
     today = ymd(now)
     in_window = (now.hour == 0 and 1 <= now.minute <= 4)
@@ -373,44 +466,62 @@ async def daily_rollover_if_needed(now: datetime):
         if last_rollover_date == today:
             return
 
-    try:
-        current_is_light = await get_device_online_status()
-    except Exception:
-        return
-
     now_ts = time.time()
 
+    # беремо "effective" статус з OFFLINE-логікою
+    tuya_ok = False
+    current_is_light = None  # type: ignore
+    try:
+        current_is_light = await get_device_online_status()
+        tuya_ok = True
+    except Exception:
+        tuya_ok = False
+
     async with STATE_LOCK:
-        # ініціалізація
+        # init
         if last_online_state is None or last_change_time is None:
-            last_online_state = current_is_light
+            last_online_state = bool(current_is_light) if tuya_ok else False
             last_change_time = now_ts
             segment_start_time = now_ts
             last_rollover_date = today
+
+            tuya_online = tuya_ok
+            last_seen = now_ts if tuya_ok else last_seen
+            offline_since = None if tuya_ok else (offline_since or now_ts)
+
             save_state()
             return
+
+        # update reachability tracking (persist for /status)
+        if tuya_ok:
+            tuya_online = True
+            last_seen = now_ts
+            offline_since = None
+            effective = bool(current_is_light)
+        else:
+            tuya_online = False
+            if offline_since is None:
+                offline_since = now_ts
+            offline_age = now_ts - float(offline_since or now_ts)
+            # якщо вже довго OFFLINE — вважаємо "немає світла", інакше не міняємо стан
+            effective = False if offline_age >= OFFLINE_TIMEOUT else last_online_state
 
         if segment_start_time is None:
             segment_start_time = last_change_time
 
         # якщо статус змінився, але monitor "проспав" — трактуємо як реальну зміну зараз
-        if current_is_light != last_online_state:
-            # закриваємо попередній сегмент
+        if effective != last_online_state:
             dur = int(now_ts - segment_start_time)
             if dur > 0:
                 save_log(last_online_state, dur, end_ts=int(now_ts))
 
-            # фіксуємо "реальну" зміну
-            last_online_state = current_is_light
-            last_change_time = now_ts          # бо це фактична зміна (хай і з похибкою)
+            last_online_state = effective
+            last_change_time = now_ts
             segment_start_time = now_ts
         else:
-            # стан той самий: ріжемо ТІЛЬКИ для звітів
             dur = int(now_ts - segment_start_time)
             if dur > 0:
                 save_log(last_online_state, dur, end_ts=int(now_ts))
-
-            # важливо: last_change_time НЕ чіпаємо
             segment_start_time = now_ts
 
         last_rollover_date = today
@@ -476,7 +587,7 @@ async def send_monthly_summary(now: datetime):
 
 async def summary_scheduler():
     """
-    00:01–00:04 Kyiv: daily rollover (ріжемо лог, не скидаючи last_change_time)
+    00:01–00:04 Kyiv: daily rollover
     08:00–08:04 Kyiv: daily; Monday weekly; 1st monthly
     """
     load_state()
@@ -542,9 +653,21 @@ async def handle_update(update: dict):
                     await bot.send_message(CHAT_ID, "📡 Поточний статус:\nℹ️ Ще немає даних")
                 else:
                     dur = hhmm(int(time.time() - last_change_time))
+                    extra = ""
+
+                    if not tuya_online:
+                        if offline_since:
+                            off_dur = int(time.time() - float(offline_since))
+                            extra = (
+                                f"\n⚠️ Tuya OFFLINE: {hhmm(off_dur)}"
+                                f"\n(після {OFFLINE_TIMEOUT}с OFFLINE вважаємо: немає світла)"
+                            )
+                        else:
+                            extra = "\n⚠️ Tuya OFFLINE"
+
                     await bot.send_message(
                         CHAT_ID,
-                        f"📡 Поточний статус:\n{state_line(last_online_state)}\n⏱ У цьому стані: {dur}"
+                        f"📡 Поточний статус:\n{state_line(last_online_state)}\n⏱ У цьому стані: {dur}{extra}"
                     )
 
         elif cmd == "/last_change":
@@ -643,4 +766,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
