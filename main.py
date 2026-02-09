@@ -566,7 +566,7 @@ async def handle_update(update: dict):
             light, dark = summarize_range(start_ts, end_ts)
             await bot.send_message(
                 CHAT_ID,
-                "📊 За день :\n"
+                "📊 За день (вчора 00:00→сьогодні 00:00):\n"
                 f"💡 Світло {hhmm(light)}\n"
                 f"🌑 Темрява {hhmm(dark)}"
             )
@@ -577,7 +577,7 @@ async def handle_update(update: dict):
             light, dark = summarize_range(start_ts, end_ts)
             await bot.send_message(
                 CHAT_ID,
-                "📊 За тиждень :\n"
+                "📊 За тиждень (попередній Пн→Пн):\n"
                 f"💡 Світло {days_hhmm(light)}\n"
                 f"🌑 Темрява {days_hhmm(dark)}"
             )
@@ -589,7 +589,7 @@ async def handle_update(update: dict):
             light, dark = summarize_range(start_ts, end_ts)
             await bot.send_message(
                 CHAT_ID,
-                f"📊 За місяць {label} :\n"
+                f"📊 За місяць {label} (попередній):\n"
                 f"💡 Світло {days_hhmm(light)}\n"
                 f"🌑 Темрява {days_hhmm(dark)}"
             )
